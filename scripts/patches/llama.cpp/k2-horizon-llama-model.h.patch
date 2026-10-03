@@ -1,0 +1,16 @@
+K2-Horizon architecture support, ported from MBZUAI-IFM/llama.cpp
+(branch model/K2Horizon, based on b10666) onto this tree. Drop once
+upstream llama.cpp merges K2-Horizon.
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -302,6 +302,10 @@
+     struct ggml_tensor * wv_enc    = nullptr;
+     struct ggml_tensor * wo_enc    = nullptr;
+     struct ggml_tensor * wqkv_gate = nullptr;
++    // K2 Horizon MoVA
++    struct ggml_tensor * attn_v_gate   = nullptr;
++    struct ggml_tensor * attn_v_gate_b = nullptr;
++    struct ggml_tensor * attn_v_exps   = nullptr;
+ 
+     // relative position bias
+     struct ggml_tensor * attn_rel_b       = nullptr;

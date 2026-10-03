@@ -1,0 +1,97 @@
+name: K2-Horizon release (Android)
+
+# Builds this fork's Android native libraries (llama.cpp with the K2-Horizon
+# patches in scripts/patches/llama.cpp/k2-horizon-*.patch) and publishes a
+# GitHub release named after package.json's version, holding:
+#
+#   llama-rn-android-jni-libs.tar.gz   what the package's postinstall downloads
+#   llama.rn-<version>.tgz             the package itself, for the app to
+#                                      depend on by URL
+#
+# Android only: the iOS artifact is dropped from the download manifest, so
+# installing the package fetches just the Android libraries.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          df -h
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Setup Gradle cache
+        uses: burrunan/gradle-cache-action@v3
+        with:
+          gradle-version: wrapper
+
+      - name: Build Android libraries
+        run: npm run build:android-libs
+
+      - name: Check K2-Horizon is in the build
+        run: |
+          for so in android/src/main/jniLibs/arm64-v8a/*.so; do
+            if ! strings -a "$so" | grep -q 'k2-horizon'; then
+              echo "::error::$so does not contain the k2-horizon architecture"
+              exit 1
+            fi
+          done
+          ls -la android/src/main/jniLibs/arm64-v8a bin/arm64-v8a
+
+      - name: Package Android JNI libraries
+        run: tar -czf llama-rn-android-jni-libs.tar.gz android/src/main/jniLibs
+
+      - name: Write the download manifest (Android only)
+        run: |
+          node -e '
+            const fs = require("fs");
+            const crypto = require("crypto");
+            const p = "install/native-artifacts.json";
+            const m = JSON.parse(fs.readFileSync(p, "utf8"));
+            const sha = crypto.createHash("sha256")
+              .update(fs.readFileSync("llama-rn-android-jni-libs.tar.gz")).digest("hex");
+            m.artifacts = m.artifacts
+              .filter(a => a.name === "android-jni-libs")
+              .map(a => ({ ...a, sha256: sha }));
+            fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n");
+            console.log(JSON.stringify(m, null, 2));
+          '
+
+      - name: Pack the package
+        id: pack
+        run: |
+          # The postinstall would try to download from the release this job
+          # is about to create; the libraries are already in place here.
+          FILE=$(RNLLAMA_SKIP_POSTINSTALL=1 npm pack --silent | tail -1)
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          ls -la "$FILE"
+          tar -tzf "$FILE" | grep -E 'native-artifacts.json|bin/arm64-v8a|lib/module/index' | head
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v$(node -p "require('./package.json').version")"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" llama-rn-android-jni-libs.tar.gz "${{ steps.pack.outputs.file }}" --clobber
+          else
+            gh release create "$TAG" llama-rn-android-jni-libs.tar.gz "${{ steps.pack.outputs.file }}" \
+              --target "$GITHUB_SHA" --title "$TAG" --prerelease \
+              --notes "llama.rn 0.13.0-rc.6 with K2-Horizon architecture support (Android only)."
+          fi
+          echo "Package URL: https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG/${{ steps.pack.outputs.file }}"

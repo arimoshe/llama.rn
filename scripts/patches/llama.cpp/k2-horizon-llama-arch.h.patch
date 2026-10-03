@@ -1,0 +1,34 @@
+K2-Horizon architecture support, ported from MBZUAI-IFM/llama.cpp
+(branch model/K2Horizon, based on b10666) onto this tree. Drop once
+upstream llama.cpp merges K2-Horizon.
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -164,6 +164,7 @@
+     LLM_ARCH_POCKETTTS,
+     LLM_ARCH_MINIMAX_01,
+     LLM_ARCH_HRM_TEXT,
++    LLM_ARCH_K2_HORIZON,
+     LLM_ARCH_UNKNOWN,
+ };
+ 
+@@ -436,6 +437,10 @@
+     LLM_KV_DENSE_2_FEAT_OUT,
+     LLM_KV_DENSE_3_FEAT_IN,
+     LLM_KV_DENSE_3_FEAT_OUT,
++
++    // K2 Horizon MoVA 
++    LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,
++    LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT,
+ };
+ 
+ enum llm_tensor {
+@@ -714,6 +719,9 @@
+     LLM_TENSOR_DFLASH_SELECTOR_PREV,
+     LLM_TENSOR_DFLASH_SELECTOR_NEXT,
+     LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
++    // K2 Horizon MoVA
++    LLM_TENSOR_ATTN_V_GATE,
++    LLM_TENSOR_ATTN_V_EXPS,
+ };
+ 
+ 

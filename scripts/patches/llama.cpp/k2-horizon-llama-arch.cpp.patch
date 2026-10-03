@@ -1,0 +1,43 @@
+K2-Horizon architecture support, ported from MBZUAI-IFM/llama.cpp
+(branch model/K2Horizon, based on b10666) onto this tree. Drop once
+upstream llama.cpp merges K2-Horizon.
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -159,6 +159,7 @@
+     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
+     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
+     { LLM_ARCH_POCKETTTS,        "pockettts"        },
++    { LLM_ARCH_K2_HORIZON,       "k2-horizon"       },
+     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
+ };
+ 
+@@ -427,6 +428,10 @@
+     { LLM_KV_XIELU_BETA,            "xielu.beta"            },
+     { LLM_KV_XIELU_EPS,             "xielu.eps"             },
+ 
++    // K2 Horizon MoVA
++    { LLM_KV_ATTENTION_VALUE_EXPERT_COUNT,          "%s.attention.value_expert_count"},
++    { LLM_KV_ATTENTION_VALUE_EXPERT_USED_COUNT,     "%s.attention.value_expert_used_count"},
++
+     // deprecated
+     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
+     { LLM_KV_TOKENIZER_SUFFIX_ID, "tokenizer.ggml.suffix_token_id" },
+@@ -707,6 +712,8 @@
+     { LLM_TENSOR_DFLASH_SELECTOR_PREV,                   "selector_predecessor" },
+     { LLM_TENSOR_DFLASH_SELECTOR_NEXT,                   "selector_successor" },
+     { LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,                 "selector_hidden" },
++    { LLM_TENSOR_ATTN_V_GATE,                            "blk.%d.attn_v_gate"},
++    { LLM_TENSOR_ATTN_V_EXPS,                            "blk.%d.attn_v_exps"},
+ };
+ 
+ // declare information about the model weight tensors:
+@@ -998,6 +1005,9 @@
+     {LLM_TENSOR_DFLASH_SELECTOR_PREV,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DFLASH_SELECTOR_NEXT,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    // K2 Horizon MoVA
++    {LLM_TENSOR_ATTN_V_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_ATTN_V_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
+ };
+ 
+ LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

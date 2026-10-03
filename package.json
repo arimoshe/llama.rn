@@ -1,6 +1,6 @@
 {
   "name": "llama.rn",
-  "version": "0.13.0-rc.6",
+  "version": "0.13.0-rc.6-k2h.1",
   "description": "React Native binding of llama.cpp",
   "main": "lib/commonjs/index",
   "module": "lib/module/index",
@@ -69,7 +69,7 @@
     "llama",
     "llama-2"
   ],
-  "repository": "https://github.com/mybigday/llama.rn",
+  "repository": "https://github.com/arimoshe/llama.rn",
   "bin": {
     "llama-rn-download-artifacts": "./install/download-native-artifacts.js"
   },

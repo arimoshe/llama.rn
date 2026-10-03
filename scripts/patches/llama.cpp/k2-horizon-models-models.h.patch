@@ -1,0 +1,37 @@
+K2-Horizon architecture support, ported from MBZUAI-IFM/llama.cpp
+(branch model/K2Horizon, based on b10666) onto this tree. Drop once
+upstream llama.cpp merges K2-Horizon.
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2681,3 +2681,31 @@
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
++
++
++struct llama_model_k2_horizon : public llama_model_base {
++    llama_model_k2_horizon(
++        const llama_model_params & params
++    ) : llama_model_base(params) {}
++
++    void load_arch_hparams(llama_model_loader & ml) override;
++
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    struct graph: public llm_graph_context {
++        graph(
++            const llama_model & model,
++            const llm_graph_params & params
++        );
++
++        ggml_tensor * build_routed_value (
++            const llama_layer & layer,
++            ggml_tensor * cur,
++            int il // layer index
++        ) const;
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(
++        const llm_graph_params & params
++    ) const override;
++};

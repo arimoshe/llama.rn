@@ -1,0 +1,13 @@
+K2-Horizon architecture support, ported from MBZUAI-IFM/llama.cpp
+(branch model/K2Horizon, based on b10666) onto this tree. Drop once
+upstream llama.cpp merges K2-Horizon.
+--- a/src/llama-vocab.h
++++ b/src/llama-vocab.h
+@@ -68,6 +68,7 @@
+     LLAMA_VOCAB_PRE_TYPE_HY_V4             = 57,
+     LLAMA_VOCAB_PRE_TYPE_SPARK2_5          = 58,
+     LLAMA_VOCAB_PRE_TYPE_UFAKZEKA          = 59,
++    LLAMA_VOCAB_PRE_TYPE_K2_HORIZON        = 60,
+ };
+ 
+ struct LLM_KV;

@@ -1,0 +1,22 @@
+K2-Horizon architecture support, ported from MBZUAI-IFM/llama.cpp
+(branch model/K2Horizon, based on b10666) onto this tree. Drop once
+upstream llama.cpp merges K2-Horizon.
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -344,6 +344,8 @@
+             return new llama_model_kimi_k3(params);
+         case LLM_ARCH_STEP35:
+             return new llama_model_step35(params);
++        case LLM_ARCH_K2_HORIZON:
++            return new llama_model_k2_horizon(params);
+         case LLM_ARCH_SPARK2_5:
+             return new llama_model_spark2_5(params);
+         default:
+@@ -3122,6 +3124,7 @@
+         case LLM_ARCH_MAPLE:
+         case LLM_ARCH_HRM_TEXT:
+         case LLM_ARCH_BARBET:
++        case LLM_ARCH_K2_HORIZON:
+             return LLAMA_ROPE_TYPE_NEOX;
+ 
+         case LLM_ARCH_DFLASH:
