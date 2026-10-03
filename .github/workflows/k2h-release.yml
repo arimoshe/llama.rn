@@ -12,6 +12,11 @@ name: K2-Horizon release (Android)
 # installing the package fetches just the Android libraries.
 
 on:
+  # A push to this branch rebuilds and republishes; workflow_dispatch alone
+  # cannot start it, since GitHub only dispatches workflows on the default
+  # branch.
+  push:
+    branches: [k2-horizon]
   workflow_dispatch:
 
 permissions:
