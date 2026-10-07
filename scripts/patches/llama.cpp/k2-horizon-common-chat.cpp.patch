@@ -1,0 +1,17 @@
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1158,6 +1158,14 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
+         return common_chat_params_init_ling3(tmpl, params);
+     }
+ 
++    // K2-Horizon - ifm-prefixed markers; <ifm|arg_key> is unique to it among
++    // the tagged-arg templates
++    if (src.find("<ifm|tool_call>") != std::string::npos &&
++        src.find("<ifm|arg_key>") != std::string::npos) {
++        LOG_DBG("Using specialized template: K2-Horizon\n");
++        return common_chat_params_init_k2_horizon(tmpl, params);
++    }
++
+     // Cohere2 MoE / North Code - marker-wrapped format with <|START_TEXT|> content and
+     // <|START_ACTION|> JSON tool calls. <|START_TEXT|> is unique to this template (the older
+     // Command-R templates use <|START_RESPONSE|>).

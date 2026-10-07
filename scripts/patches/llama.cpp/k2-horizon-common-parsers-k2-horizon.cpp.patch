@@ -1,0 +1,234 @@
+--- /dev/null
++++ b/common/parsers/k2-horizon.cpp
+@@ -0,0 +1,231 @@
++#include "parsers.h"
++
++// K2-Horizon (IFM) - ChatML-like turns with ifm-prefixed markers and tagged
++// tool calls in its default "xml" tool_call_format:
++//   assistant := <ifm|think>\n reasoning </ifm|think> [content]
++//                [<ifm|tool_calls>
++//                 <ifm|tool_call>name
++//                 <ifm|arg_key>k</ifm|arg_key>
++//                 <ifm|arg_value>v</ifm|arg_value>
++//                 </ifm|tool_call>
++//                 </ifm|tool_calls>] <|ifm|im_end|>
++// The generation prompt always ends "<|ifm|im_start|>assistant\n<ifm|think>\n":
++// the template has no switch for thinking. With thinking off the block is
++// pre-closed here, the same "<ifm|think>\n</ifm|think>" the template writes for
++// a past turn that had no reasoning.
++//
++// The template also raises on an assistant message without a thinking field,
++// which every past turn sent back without reasoning would be, and on tool call
++// arguments given as a JSON string, so both are fixed up before rendering.
++common_chat_params common_chat_params_init_k2_horizon(const common_chat_template &          tmpl,
++                                                             const autoparser::generation_params & inputs) {
++    const std::string IM_END      = "<|ifm|im_end|>";
++    const std::string OPENER      = "<|ifm|im_start|>assistant";
++    const std::string THINK_START = "<ifm|think>";
++    const std::string THINK_END   = "</ifm|think>";
++    const std::string CALLS_START = "<ifm|tool_calls>";
++    const std::string CALLS_END   = "</ifm|tool_calls>";
++    const std::string CALL_START  = "<ifm|tool_call>";
++    const std::string CALL_END    = "</ifm|tool_call>";
++    const std::string ARG_KEY     = "<ifm|arg_key>";
++    const std::string ARG_KEY_END = "</ifm|arg_key>";
++    const std::string ARG_VAL     = "<ifm|arg_value>";
++    const std::string ARG_VAL_END = "</ifm|arg_value>";
++
++    autoparser::generation_params params = inputs;
++    if (params.messages.is_array()) {
++        for (auto & msg : params.messages) {
++            if (!msg.is_object() || msg.value("role", "") != "assistant") continue;
++            bool has_thinking = false;
++            for (const char * key : { "think", "think_fast", "think_faster", "reasoning_content", "reasoning" }) {
++                if (msg.contains(key) && msg.at(key).is_string()) has_thinking = true;
++            }
++            // the template takes tool call arguments as a dict and raises on
++            // the JSON string the OpenAI-style history carries
++            if (msg.contains("tool_calls") && msg.at("tool_calls").is_array()) {
++                for (auto & call : msg.at("tool_calls")) {
++                    auto & fn = call.contains("function") && call.at("function").is_object() ? call.at("function") : call;
++                    if (fn.contains("arguments") && fn.at("arguments").is_string()) {
++                        auto parsed = json::parse_no_throw(fn.at("arguments").get<std::string>());
++                        fn["arguments"] = !parsed.is_discarded() && parsed.is_object() ? parsed : json::object();
++                    }
++                }
++            }
++            if (!has_thinking) {
++                // a null left by the OpenAI-style conversion would raise too
++                for (const char * key : { "think", "think_fast", "think_faster", "reasoning" }) {
++                    if (msg.contains(key) && msg.at(key).is_null()) msg.erase(key);
++                }
++                msg["reasoning_content"] = "";
++            }
++        }
++    }
++
++    common_chat_params data;
++
++    data.prompt            = common_chat_template_direct_apply_impl(tmpl, params);
++    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, params);
++    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
++    data.supports_thinking = true;
++
++    data.preserved_tokens = {
++        THINK_START, THINK_END, CALLS_START, CALLS_END, CALL_START, CALL_END,
++        ARG_KEY, ARG_KEY_END, ARG_VAL, ARG_VAL_END, IM_END,
++    };
++
++    data.thinking_start_tag = THINK_START;
++    // a tool call block can arrive before the think block is closed
++    data.thinking_end_tags  = { THINK_END, CALLS_START };
++
++    data.message_delimiters = {
++        { COMMON_CHAT_ROLE_ASSISTANT, "<|ifm|im_start|>assistant" },
++        { COMMON_CHAT_ROLE_USER,      "<|ifm|im_start|>user"      },
++        { COMMON_CHAT_ROLE_TOOL,      "<|ifm|im_start|>tool"      },
++        { COMMON_CHAT_ROLE_SYSTEM,    "<|ifm|im_start|>system"    },
++    };
++
++    // the end-of-turn marker spelled out as text tokens does not stop
++    // generation by itself
++    data.additional_stops = { IM_END };
++
++    if (inputs.has_continuation()) {
++        const auto & msg = inputs.continue_msg;
++
++        data.generation_prompt = OPENER + "\n" + THINK_START + "\n" + msg.reasoning_content;
++        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
++            data.generation_prompt += THINK_END + msg.render_content();
++        }
++
++        data.prompt += data.generation_prompt;
++    } else if (inputs.add_generation_prompt && !inputs.enable_thinking) {
++        // only when the rendered prompt really ends inside the think block: a
++        // reasoning_effort other than high opens a differently named one
++        const std::string open_tail = THINK_START + "\n";
++        if (data.prompt.size() >= open_tail.size() &&
++            data.prompt.compare(data.prompt.size() - open_tail.size(), open_tail.size(), open_tail) == 0) {
++            data.prompt            += THINK_END;
++            data.generation_prompt += THINK_END;
++        }
++    }
++
++    bool think_open = false;
++    if (inputs.has_continuation()) {
++        think_open = inputs.continue_final_message != COMMON_CHAT_CONTINUATION_CONTENT;
++    } else {
++        auto last_open  = data.generation_prompt.rfind(THINK_START);
++        auto last_close = data.generation_prompt.rfind(THINK_END);
++        think_open      = last_open != std::string::npos &&
++                     (last_close == std::string::npos || last_open > last_close);
++    }
++
++    auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
++    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
++    auto include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
++
++    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
++        auto end = p.end();
++
++        // the effective parse input is generation_prompt + model output, so the
++        // assistant opener is optionally consumed here
++        auto opener = p.optional(p.literal(OPENER) + p.optional(p.space()));
++
++        auto body_end   = think_open ? p.until_one_of({ THINK_END, CALLS_START }) : p.until_one_of({ THINK_END });
++        auto think_body = extract_reasoning ? p.reasoning(body_end) : p.content(body_end);
++
++        auto reasoning = p.optional(p.optional(p.literal(THINK_START) + p.optional(p.space())) + think_body +
++                                    p.optional(p.literal(THINK_END)));
++
++        auto content = p.optional(p.content(p.until_one_of({ CALLS_START })));
++
++        // a trailing end-of-turn marker is consumed instead of leaking into content
++        auto tail = p.optional(p.content(p.until(IM_END))) + p.optional(p.literal(IM_END));
++
++        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
++            return opener + reasoning + tail + end;
++        }
++
++        auto tool_choices = p.choice();
++        auto arg_close    = p.tool_arg_close(p.literal(ARG_VAL_END));
++        auto arg_string   = p.rule("k2h-arg-string",
++                                   p.tool_arg_string_value(p.until(ARG_VAL_END)) + arg_close);
++
++        foreach_function(inputs.tools, [&](const json & tool) {
++            const auto & function = tool.at("function");
++            std::string  name     = function.at("name");
++
++            std::vector<common_peg_parser> required_args;
++            std::vector<common_peg_parser> optional_args;
++
++            foreach_parameter(function, [&](const common_chat_schema_property & param, const common_chat_schema_document_ptr & doc) {
++                auto rule_name = "k2h-arg-" + name + "-" + param.name;
++
++                auto types = param.schema->value_types();
++
++                // strings are raw text up to the closing tag ("String and
++                // scalar parameters should be written as plain text"), other
++                // types are JSON literals; each alternative consumes the
++                // closing tag so a JSON prefix cannot commit the choice early
++                auto arg_value = p.eps();
++                if (!types.has(common_chat_schema::TYPE_STRING)) {
++                    arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
++                } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
++                    arg_value = arg_string;
++                } else {
++                    arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close) | arg_string,
++                                       "k2h-arg-string");
++                }
++
++                auto arg = p.rule(rule_name,
++                    p.optional(p.space()) +
++                    p.tool_arg(p.tool_arg_open(p.literal(ARG_KEY) + p.tool_arg_name(p.literal(param.name)) +
++                                               p.literal(ARG_KEY_END)) +
++                               p.optional(p.space()) + p.literal(ARG_VAL) +
++                               arg_value));
++
++                (param.required ? required_args : optional_args).push_back(arg);
++            });
++
++            auto args = p.permute("k2h-" + name + "-args", required_args);
++            if (!optional_args.empty()) {
++                args = args + p.zero_or_more(p.choice(optional_args));
++            }
++
++            auto call = p.tool(p.tool_open(p.literal(CALL_START) + p.tool_name(p.literal(name)) +
++                                           p.optional(p.space())) +
++                               p.tool_args(args) +
++                               p.tool_close(p.optional(p.space()) + p.literal(CALL_END)));
++
++            tool_choices |= p.rule("k2h-tool-" + name, call);
++        });
++
++        auto calls = inputs.parallel_tool_calls ?
++                     tool_choices + p.zero_or_more(p.optional(p.space()) + tool_choices) :
++                     tool_choices;
++
++        // all calls sit in one <ifm|tool_calls> block
++        auto tools_section = p.trigger_rule("k2h-tool-calls",
++            p.literal(CALLS_START) + p.optional(p.space()) + calls + p.optional(p.space()) +
++            p.optional(p.literal(CALLS_END)) + p.optional(p.space()) +
++            p.optional(p.content(p.until(IM_END))) + p.optional(p.literal(IM_END)));
++
++        auto tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? tools_section :
++                                                                             p.optional(tools_section);
++
++        return opener + reasoning + content + tools + tail + end;
++    });
++
++    data.parser = parser.save();
++
++    if (include_grammar) {
++        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
++            parser.build_grammar(builder, data.grammar_lazy);
++        });
++
++        data.grammar_triggers = {
++            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, CALLS_START },
++        };
++    }
++
++    return data;
++}
