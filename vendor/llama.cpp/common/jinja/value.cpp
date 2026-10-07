@@ -470,6 +470,22 @@ const func_builtins & global_builtins() {
             return mk_val<value_bool>(res);
         }},
         {"test_is_undefined", test_type_fn<value_undefined>},
+        {"test_is_sameas", [](const func_args & args) -> value {
+            // Python's `is`. Values here are copies, not objects with an
+            // identity, so scalars of the same type compare by value — which
+            // is what `x is sameas true` / `is sameas none` need — and
+            // containers only match themselves.
+            args.ensure_count(2, 2);
+            const auto & a = args.get_pos(0);
+            const auto & b = args.get_pos(1);
+            if (a == b) return mk_val<value_bool>(true);
+            if (a->type() != b->type()) return mk_val<value_bool>(false);
+            if (is_val<value_none>(a) || is_val<value_undefined>(a)) return mk_val<value_bool>(true);
+            if (is_val<value_bool>(a) || is_val<value_int>(a) || is_val<value_float>(a) || is_val<value_string>(a)) {
+                return mk_val<value_bool>(value_compare(a, b, value_compare_op::eq));
+            }
+            return mk_val<value_bool>(false);
+        }},
         {"test_is_eq", test_compare_fn<value_compare_op::eq>},
         {"test_is_equalto", test_compare_fn<value_compare_op::eq>},
         {"test_is_ge", test_compare_fn<value_compare_op::ge>},

@@ -97,6 +97,6 @@ jobs:
           else
             gh release create "$TAG" llama-rn-android-jni-libs.tar.gz "${{ steps.pack.outputs.file }}" \
               --target "$GITHUB_SHA" --title "$TAG" --prerelease \
-              --notes "llama.rn 0.13.0-rc.6 with K2-Horizon architecture support (Android only)."
+              --notes "llama.rn 0.13.0-rc.6 with K2-Horizon support (Android only)."
           fi
           echo "Package URL: https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG/${{ steps.pack.outputs.file }}"

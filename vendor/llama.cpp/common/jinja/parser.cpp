@@ -85,6 +85,16 @@ private:
         return peek().t == token::identifier && peek().value == name;
     }
 
+    // Whether the token after a test name is its bare argument. An identifier
+    // that is an operator or keyword ends the test instead: `x is defined and y`.
+    bool starts_bare_test_arg() const {
+        const auto & t = peek();
+        if (t.t == token::numeric_literal || t.t == token::string_literal) return true;
+        if (t.t != token::identifier) return false;
+        static const std::vector<std::string> ends = {"and", "or", "not", "is", "in", "if", "else"};
+        return std::find(ends.begin(), ends.end(), t.value) == ends.end();
+    }
+
     bool is_statement(const std::vector<std::string> & names) const {
         if (peek(0).t != token::open_statement || peek(1).t != token::identifier) {
             return false;
@@ -429,8 +439,16 @@ private:
             bool negate = false;
             if (is_identifier("not")) { ++current; negate = true; }
             auto test_id = parse_primary_expression();
-            // FIXME: tests can also be expressed like this: if x is eq 3
-            if (is(token::open_paren)) test_id = parse_call_expression(std::move(test_id));
+            if (is(token::open_paren)) {
+                test_id = parse_call_expression(std::move(test_id));
+            } else if (starts_bare_test_arg()) {
+                // A test with one argument and no parentheses, as Jinja allows:
+                // `x is sameas true`, `n is divisibleby 3`.
+                size_t arg_pos = current;
+                statements args;
+                args.push_back(parse_primary_expression());
+                test_id = mk_stmt<call_expression>(arg_pos, std::move(test_id), std::move(args));
+            }
             operand = mk_stmt<test_expression>(start_pos, std::move(operand), negate, std::move(test_id));
         }
         return operand;
