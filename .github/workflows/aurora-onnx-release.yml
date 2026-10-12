@@ -1,0 +1,67 @@
+name: AuroraIMG-6M ONNX release
+
+# Exports AuroraIMG-6M (AuroraAI-Research, Apache-2.0) to ONNX and publishes the
+# files as the release AIDungeonMaster's image test downloads from. Built here
+# from the model's own weights, at a pinned Hugging Face commit, with the tool
+# versions the app's checksums were made with: the export has to match
+# SHA256SUMS byte for byte, or nothing is published.
+
+on:
+  push:
+    branches: [aurora-img-onnx]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  HF_REPO: AuroraAI-Research/AuroraIMG-6M
+  HF_REVISION: 3d66743c3139d034b832a670d067221f5d544bbb
+  TAG: aurora-img-6m-onnx-v1
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the export tools
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.1
+          pip install onnx==1.23.2 onnxruntime==1.31.0 onnxscript==0.7.2 safetensors==0.8.0 \
+            numpy==2.4.6 pillow==12.3.0 tokenizers==0.23.3
+
+      - name: Download the model at its pinned commit
+        run: |
+          base="https://huggingface.co/$HF_REPO/resolve/$HF_REVISION"
+          for f in text_encoder/diffusion_pytorch_model.safetensors unet/diffusion_pytorch_model.safetensors \
+                   vae/diffusion_pytorch_model.safetensors vae/config.json tokenizer/tokenizer.json; do
+            mkdir -p "model/$(dirname "$f")"
+            curl -fsSL -o "model/$f" "$base/$f"
+          done
+
+      - name: Export and check against PyTorch
+        run: |
+          python -I export.py "$PWD/model" 2>&1 | grep -v -i warning
+          cp model/tokenizer/tokenizer.json tokenizer.json
+
+      - name: Match the app's checksums
+        run: |
+          sha256sum text_encoder.onnx unet.onnx vae_decoder.onnx tokenizer.json
+          sha256sum -c SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::$TAG is already released"
+            exit 0
+          fi
+          gh release create "$TAG" text_encoder.onnx unet.onnx vae_decoder.onnx tokenizer.json SHA256SUMS \
+            --target "$GITHUB_SHA" --title "AuroraIMG-6M ONNX (v1)" --prerelease \
+            --notes "AuroraIMG-6M (https://huggingface.co/$HF_REPO, Apache-2.0, commit $HF_REVISION) exported to ONNX (opset 17, fp32) for AIDungeonMaster's on-device image test. Weights unmodified; exported from the model's own PyTorch classes (aurora_model.py, from its pipeline.py) and checked against PyTorch over the 50-step pipeline by export.py. See README.md on the aurora-img-onnx branch for the inputs and outputs."
