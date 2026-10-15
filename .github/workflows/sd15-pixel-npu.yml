@@ -1,12 +1,15 @@
 name: SD1.5 PixelArtRedmond for the 8 Elite NPU
 
-# Stable Diffusion 1.5 with the PixelArtRedmond 1.5 LoRA fused in, quantized
-# w8a16 and compiled by Qualcomm AI Hub for the Snapdragon 8 Elite for Galaxy
-# (precompiled QNN ONNX), for AIDungeonMaster's image test. The LoRA changes
-# only the UNet, so only the UNet is rebuilt: the app keeps Qualcomm's stock
-# text encoder and VAE for the same chip.
+# The UNet of Liberte Redmond (an SD1.5 fine-tune) with the PixelArtRedmond
+# 1.5 LoRA fused in, quantized w8a16 and compiled by Qualcomm AI Hub for the
+# Snapdragon 8 Elite for Galaxy (precompiled QNN ONNX), for AIDungeonMaster's
+# image test. The LoRA was made for Liberte Redmond; fused into plain SD1.5
+# (v1) it drew far worse. Only the UNet is rebuilt: the app keeps Qualcomm's
+# stock SD1.5 text encoder and VAE for the same chip, with which Liberte's
+# UNet draws about as well as with its own (checked side by side).
 #
-#   merge.py          fuse the LoRA into SD1.5 (diffusers layout)
+#   merge.py          fuse the LoRA into Liberte Redmond's UNet, with
+#                     SD1.5's text encoder and VAE (diffusers layout)
 #   quantize_unet.py  calibrate and quantize the UNet with AIMET
 #                     (qai_hub_models' recipe), on prompts.txt
 #   export_unet.py    compile on AI Hub (QAI_HUB_API_TOKEN secret)
@@ -64,7 +67,10 @@ jobs:
 
       - name: Fuse the LoRA
         run: |
-          python merge.py /mnt/work/merged
+          # Liberte Redmond 1.0 (Civitai model version 100409), pinned
+          curl -sSfL -o /mnt/work/liberte.safetensors https://civitai.com/api/download/models/100409
+          echo "04a89af9496dba5d124ecacd2d534cae11200fd5cb03faa61e48c5b3f160ab49  /mnt/work/liberte.safetensors" | sha256sum -c -
+          python merge.py /mnt/work/merged /mnt/work/liberte.safetensors
           # qai-hub-models 0.64.0 recognizes a local checkpoint folder only
           # by these names
           for d in unet text_encoder vae; do

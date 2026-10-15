@@ -51,7 +51,7 @@ ins = {vi.name: tensor(vi, next((n for n in model.graph.node if n.op_type == "De
        for vi in model.graph.input}
 outs = {vi.name: tensor(vi, next((n for n in model.graph.node if n.op_type == "QuantizeLinear" and n.output[0] == vi.name), None))
         for vi in model.graph.output}
-meta = {"model_id": "stable_diffusion_v1_5_pixelartredmond", "precision": "w8a16", "runtime": "precompiled_qnn_onnx",
+meta = {"model_id": "stable_diffusion_v1_5_liberte_pixelartredmond", "precision": "w8a16", "runtime": "precompiled_qnn_onnx",
         "model_files": {"unet.onnx": {"inputs": ins, "outputs": outs}}}
 with open(os.path.join(out, "metadata.json"), "w") as f:
     json.dump(meta, f, indent=2)
