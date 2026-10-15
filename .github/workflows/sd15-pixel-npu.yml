@@ -77,6 +77,11 @@ jobs:
           echo "calibration: $SAMPLES prompts x $STEPS steps"
           python quantize_unet.py --checkpoint /mnt/work/merged -o /mnt/work/pixel \
             --num-samples "$SAMPLES" --num-steps "$STEPS" --prompt prompts.txt --host-device cpu
+          # export builds the whole pipeline even for --components unet: the
+          # text encoder and VAE load from the merged float weights (the LoRA
+          # left them as stock SD1.5) and are not compiled
+          ln -s /mnt/work/merged/text_encoder /mnt/work/pixel/text_encoder
+          ln -s /mnt/work/merged/vae /mnt/work/pixel/vae
           find /mnt/work/pixel -maxdepth 3 -exec ls -ld {} \;
 
       - name: Compile on Qualcomm AI Hub
