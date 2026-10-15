@@ -1,0 +1,20 @@
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1266,6 +1266,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             }
+         }
+ 
++        // Experts streamed through the CPU expert cache (ggml-cpu.c) stay in
++        // the mapped file: the default CPU buffer type, never a repacked
++        // copy, which would put the whole model in memory. The other weights
++        // are still free to take one.
++        if (op == GGML_OP_MUL_MAT_ID && use_mmap && getenv("LLAMA_EXPERT_CACHE_MB") != nullptr) {
++            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++            if (cpu_dev && ggml_backend_buft_get_device(buft) == cpu_dev) {
++                buft = ggml_backend_dev_buffer_type(cpu_dev);
++            }
++        }
++
+         // avoid using a host buffer when using mmap
+         auto * buft_dev = ggml_backend_buft_get_device(buft);
+         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {

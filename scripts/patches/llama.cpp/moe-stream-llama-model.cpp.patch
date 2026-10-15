@@ -1,0 +1,17 @@
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1289,6 +1289,14 @@ llama_model::~llama_model() {
+     for (auto * lora : loras) {
+         delete lora;
+     }
++    // slices cached from this model's experts are stale once it is gone
++    if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
++        auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
++        auto * clear = (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_clear");
++        if (clear) {
++            clear();
++        }
++    }
+ }
+ 
+ void llama_model_base::load_stats(llama_model_loader & ml) {

@@ -1,0 +1,388 @@
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1467,6 +1467,337 @@ UseGgmlGemm2:;
+     }
+ }
+ 
++// expert cache
++//
++// For a mixture-of-experts model whose expert weights stay in the mapped
++// model file (LLAMA_EXPERT_CACHE_MB set, see llama-model-loader.cpp) and do
++// not fit in memory. Left to the page cache, every page fault pulls in a
++// readahead window of neighbouring experts the token does not use, and the
++// kernel evicts the experts that are used, so each token reads several times
++// the bytes it needs. Here, once routing has picked the experts, the missing
++// ones are requested together (MADV_WILLNEED on exactly their bytes, also for
++// the same layer's sibling gate/up/down tensors, which run next), copied into
++// an LRU cache of whole expert slices with a fixed budget, and the matrix
++// multiplication reads from the copies. Readahead is switched off for the
++// expert tensors (MADV_RANDOM) and the mapped pages are dropped once copied.
++
++#if defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++#define GGML_EXPERT_CACHE 1
++#endif
++
++#ifdef GGML_EXPERT_CACHE
++
++struct ggml_ec_entry {
++    void *   data;
++    uint64_t used; // tick of the last use
++    uint64_t pin;  // op serial that needs it now
++};
++
++struct ggml_ec_tensor {
++    const void * base;   // src0->data in the mapping
++    const void * buffer; // src0->buffer, told apart from a later model at the same address
++    size_t       slice;  // bytes per expert
++    int          n;      // experts
++    int          layer;  // from the name "blk.N.ffn_*_exps", -1 if none
++    struct ggml_ec_entry * e;
++};
++
++#define GGML_EC_MAX_TENSORS 1024
++
++static struct {
++    size_t   budget;
++    size_t   used;
++    uint64_t tick;
++    uint64_t serial;
++    int      n_tensors;
++    struct ggml_ec_tensor t[GGML_EC_MAX_TENSORS];
++    uint64_t hits, misses;
++} g_ec;
++
++// Slices read straight from the mapping by the last pass-through op, dropped
++// at the next prepare: by then every thread is past that op (ggml-cpu runs a
++// barrier between nodes).
++#define GGML_EC_MAX_PENDING 1024
++static struct { const void * p; size_t n; } g_ec_pending[GGML_EC_MAX_PENDING];
++static int g_ec_n_pending;
++
++// for the stats file (ggml_ec_write_stats)
++static int g_ec_last_layer = -1;
++static uint64_t g_ec_read_bytes, g_ec_passthrough;
++
++static size_t ggml_ec_page(void) {
++    static size_t page = 0;
++    if (!page) {
++        long p = sysconf(_SC_PAGESIZE);
++        page = p > 0 ? (size_t) p : 4096;
++    }
++    return page;
++}
++
++// whole pages inside [p, p + n), so the advice never reaches a neighbour
++static void ggml_ec_advise(const void * p, size_t n, int advice) {
++    const size_t page = ggml_ec_page();
++    uintptr_t beg = ((uintptr_t) p + page - 1) & ~(uintptr_t)(page - 1);
++    uintptr_t end = ((uintptr_t) p + n) & ~(uintptr_t)(page - 1);
++    if (end > beg) {
++        madvise((void *) beg, end - beg, advice);
++    }
++}
++
++// the whole pages covering [p, p + n): for reading ahead
++static void ggml_ec_willneed(const void * p, size_t n) {
++    const size_t page = ggml_ec_page();
++    uintptr_t beg = (uintptr_t) p & ~(uintptr_t)(page - 1);
++    uintptr_t end = ((uintptr_t) p + n + page - 1) & ~(uintptr_t)(page - 1);
++    madvise((void *) beg, end - beg, MADV_WILLNEED);
++}
++
++static size_t ggml_ec_budget(void) {
++    const char * env = getenv("LLAMA_EXPERT_CACHE_MB");
++    if (!env) {
++        return 0;
++    }
++    long long mb = atoll(env);
++    return mb > 0 ? (size_t) mb * 1024 * 1024 : 0;
++}
++
++static void ggml_ec_free_tensor(struct ggml_ec_tensor * t) {
++    for (int i = 0; i < t->n; i++) {
++        if (t->e[i].data) {
++            free(t->e[i].data);
++            g_ec.used -= t->slice;
++        }
++    }
++    free(t->e);
++    t->e = NULL;
++}
++
++void ggml_cpu_expert_cache_clear(void) {
++    ggml_critical_section_start();
++    for (int i = 0; i < g_ec.n_tensors; i++) {
++        ggml_ec_free_tensor(&g_ec.t[i]);
++    }
++    g_ec.n_tensors = 0;
++    g_ec.used = 0;
++    g_ec.hits = g_ec.misses = 0;
++    g_ec_n_pending = 0;
++    g_ec_last_layer = -1;
++    g_ec_read_bytes = g_ec_passthrough = 0;
++    ggml_critical_section_end();
++}
++
++void ggml_cpu_expert_cache_stats(uint64_t * hits, uint64_t * misses, size_t * used, size_t * budget) {
++    if (hits)   *hits   = g_ec.hits;
++    if (misses) *misses = g_ec.misses;
++    if (used)   *used   = g_ec.used;
++    if (budget) *budget = g_ec.budget;
++}
++
++static struct ggml_ec_tensor * ggml_ec_find(const struct ggml_tensor * src0, bool add) {
++    for (int i = 0; i < g_ec.n_tensors; i++) {
++        struct ggml_ec_tensor * t = &g_ec.t[i];
++        if (t->base == src0->data && t->buffer == (const void *) src0->buffer) {
++            return t;
++        }
++    }
++    if (!add || g_ec.n_tensors == GGML_EC_MAX_TENSORS) {
++        return NULL;
++    }
++    struct ggml_ec_tensor * t = &g_ec.t[g_ec.n_tensors];
++    t->e = calloc((size_t) src0->ne[2], sizeof(struct ggml_ec_entry));
++    if (!t->e) {
++        return NULL;
++    }
++    t->base   = src0->data;
++    t->buffer = src0->buffer;
++    t->slice  = src0->nb[2];
++    t->n      = (int) src0->ne[2];
++    t->layer  = -1;
++    int layer;
++    if (sscanf(src0->name, "blk.%d.", &layer) == 1 && strstr(src0->name, "_exps") != NULL) {
++        t->layer = layer;
++    }
++    g_ec.n_tensors++;
++    // the cache decides what is read; the kernel's readahead would only
++    // bring in neighbouring experts
++    ggml_ec_advise(src0->data, ggml_nbytes(src0), MADV_RANDOM);
++    return t;
++}
++
++// frees least recently used slices not needed by the current op until
++// `need` more bytes fit; false when they cannot
++static bool ggml_ec_make_room(size_t need) {
++    while (g_ec.used + need > g_ec.budget) {
++        struct ggml_ec_tensor * best_t = NULL;
++        int best_i = -1;
++        uint64_t best = UINT64_MAX;
++        for (int i = 0; i < g_ec.n_tensors; i++) {
++            struct ggml_ec_tensor * t = &g_ec.t[i];
++            for (int j = 0; j < t->n; j++) {
++                struct ggml_ec_entry * e = &t->e[j];
++                if (e->data && e->pin != g_ec.serial && e->used < best) {
++                    best = e->used;
++                    best_t = t;
++                    best_i = j;
++                }
++            }
++        }
++        if (!best_t) {
++            return false;
++        }
++        free(best_t->e[best_i].data);
++        best_t->e[best_i].data = NULL;
++        g_ec.used -= best_t->slice;
++    }
++    return true;
++}
++
++static void ggml_ec_release_pending(void) {
++    for (int i = 0; i < g_ec_n_pending; i++) {
++        ggml_ec_advise(g_ec_pending[i].p, g_ec_pending[i].n, MADV_DONTNEED);
++    }
++    g_ec_n_pending = 0;
++}
++
++// Counters for the app's log, written to LLAMA_EXPERT_CACHE_STATS_FILE at
++// the start of each pass through the model.
++static void ggml_ec_write_stats(void) {
++    const char * path = getenv("LLAMA_EXPERT_CACHE_STATS_FILE");
++    if (!path) {
++        return;
++    }
++    char tmp[1024];
++    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
++    FILE * f = fopen(tmp, "w");
++    if (!f) {
++        return;
++    }
++    fprintf(f, "{\"hits\":%llu,\"misses\":%llu,\"passthrough\":%llu,\"readMb\":%.1f,\"usedMb\":%.1f,\"budgetMb\":%.1f,\"tensors\":%d}\n",
++            (unsigned long long) g_ec.hits, (unsigned long long) g_ec.misses, (unsigned long long) g_ec_passthrough,
++            g_ec_read_bytes / 1048576.0, g_ec.used / 1048576.0, g_ec.budget / 1048576.0, g_ec.n_tensors);
++    fclose(f);
++    rename(tmp, path);
++}
++
++// Above this many tokens in a batch the op is prompt processing: nearly every
++// expert is needed once and not again until the next batch, so caching them
++// would only push out the ones generation keeps reusing.
++#define GGML_EC_PASSTHROUGH_TOKENS 16
++
++// Fills ptrs[a] for every expert a with counts[a] > 0: the cached copy, or
++// the mapped weights when passing through or the cache is full. Returns
++// false when the cache is not used for this tensor (ptrs untouched).
++static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * counts, int64_t n_tokens, const char ** ptrs) {
++    const size_t budget = ggml_ec_budget();
++    if (budget == 0) {
++        if (g_ec.n_tensors > 0) {
++            ggml_cpu_expert_cache_clear();
++        }
++        return false;
++    }
++    // only whole, contiguous expert slices
++    if (src0->ne[2] < 2 || src0->nb[2] != src0->nb[1]*src0->ne[1] || src0->nb[3] != src0->nb[2]*src0->ne[2]) {
++        return false;
++    }
++
++    ggml_critical_section_start();
++    g_ec.budget = budget;
++    ggml_ec_release_pending();
++    struct ggml_ec_tensor * t = ggml_ec_find(src0, true);
++    if (!t) {
++        ggml_critical_section_end();
++        return false;
++    }
++    if (t->layer >= 0) {
++        if (t->layer < g_ec_last_layer) {
++            ggml_ec_write_stats();
++        }
++        g_ec_last_layer = t->layer;
++    }
++    const uint64_t serial = ++g_ec.serial;
++    const int n_as = t->n;
++    const bool passthrough = n_tokens > GGML_EC_PASSTHROUGH_TOKENS;
++
++    // request every missing slice at once, this tensor's and the layer's
++    // siblings' (which run next with the same experts), before reading any
++    for (int a = 0; a < n_as; a++) {
++        if (counts[a] == 0) {
++            continue;
++        }
++        t->e[a].pin = serial;
++        if (!t->e[a].data) {
++            ggml_ec_willneed((const char *) t->base + a*t->slice, t->slice);
++        }
++    }
++    for (int i = 0; t->layer >= 0 && i < g_ec.n_tensors; i++) {
++        struct ggml_ec_tensor * s = &g_ec.t[i];
++        if (s == t || s->buffer != t->buffer || s->n != n_as) {
++            continue;
++        }
++        if (s->layer == t->layer) {
++            for (int a = 0; a < n_as; a++) {
++                if (counts[a] > 0 && !s->e[a].data) {
++                    ggml_ec_willneed((const char *) s->base + a*s->slice, s->slice);
++                }
++            }
++        } else if (passthrough && s->layer == t->layer + 1) {
++            // prompt processing needs nearly all of the next layer too: read
++            // it while this one computes
++            ggml_ec_willneed(s->base, s->slice * (size_t) s->n);
++        }
++    }
++
++    for (int a = 0; a < n_as; a++) {
++        if (counts[a] == 0) {
++            continue;
++        }
++        struct ggml_ec_entry * e = &t->e[a];
++        const char * mapped = (const char *) t->base + a*t->slice;
++        if (e->data) {
++            g_ec.hits++;
++        } else if (passthrough && g_ec.used + t->slice > g_ec.budget) {
++            // no room without evicting: read from the mapping this once
++            g_ec_passthrough++;
++            g_ec_read_bytes += t->slice;
++            if (g_ec_n_pending < GGML_EC_MAX_PENDING) {
++                g_ec_pending[g_ec_n_pending].p = mapped;
++                g_ec_pending[g_ec_n_pending].n = t->slice;
++                g_ec_n_pending++;
++            }
++        } else {
++            // generation evicts the least recently used; prompt processing
++            // only fills free room, which warms an empty cache
++            g_ec.misses++;
++            g_ec_read_bytes += t->slice;
++            if ((passthrough || ggml_ec_make_room(t->slice)) && (e->data = malloc(t->slice)) != NULL) {
++                memcpy(e->data, mapped, t->slice);
++                g_ec.used += t->slice;
++                // the copy is what is read from now on
++                ggml_ec_advise(mapped, t->slice, MADV_DONTNEED);
++            }
++        }
++        e->used = ++g_ec.tick;
++        ptrs[a] = e->data ? (const char *) e->data : mapped;
++    }
++    ggml_critical_section_end();
++    return true;
++}
++
++#else
++
++void ggml_cpu_expert_cache_clear(void) {}
++
++void ggml_cpu_expert_cache_stats(uint64_t * hits, uint64_t * misses, size_t * used, size_t * budget) {
++    if (hits)   *hits   = 0;
++    if (misses) *misses = 0;
++    if (used)   *used   = 0;
++    if (budget) *budget = 0;
++}
++
++#endif // GGML_EXPERT_CACHE
++
+ // ggml_compute_forward_mul_mat_id
+ 
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+@@ -1596,9 +1927,14 @@ static void ggml_compute_forward_mul_mat_id(
+     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
+         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+ 
++    // where each expert's weights are read from: the expert cache's copy, or
++    // NULL for src0 itself; [0] says whether the table is in use
++    const char ** expert_ptrs = // [n_as + 1]
++        incr_ptr_aligned(&wdata_cur, (n_as + 1)*sizeof(char *), sizeof(int64_t));
++
+     // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
+     // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
+-    const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
++    bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
+ 
+     char * iqp_panels = NULL;
+ 
+@@ -1660,6 +1996,13 @@ static void ggml_compute_forward_mul_mat_id(
+                 matrix_row_counts[i02] += 1;
+             }
+         }
++
++        expert_ptrs[0] = NULL;
++#ifdef GGML_EXPERT_CACHE
++        if (!iqp && ggml_ec_prepare(src0, matrix_row_counts, ids->ne[1], expert_ptrs + 1)) {
++            expert_ptrs[0] = (const char *) src0->data;
++        }
++#endif
+     }
+ 
+     // reset current_chunk
+@@ -1684,7 +2027,7 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
+-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++        const char * src0_cur = expert_ptrs[0] ? expert_ptrs[1 + cur_a] : (const char *) src0->data + cur_a * nb02;
+         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+@@ -2915,6 +3258,8 @@ struct ggml_cplan ggml_graph_plan(
+                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
+                         // atomic_current_chunk
+                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
++                        // expert_ptrs
++                        cur += (n_as + 1)*sizeof(char *) + sizeof(int64_t);
+                         // the IQ panel path needs one scratch panel per thread on top of that
+                         if (ggml_cpu_iqp_supports_mul_mat_id(node)) {
+                             cur += n_tasks * ggml_cpu_iqp_scratch_size(node) + 64;

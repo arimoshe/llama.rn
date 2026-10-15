@@ -1,6 +1,63 @@
 --- a/src/llama-mmap.cpp
 +++ b/src/llama-mmap.cpp
-@@ -491,22 +491,22 @@
+@@ -462,6 +462,40 @@
+ }
+ #endif
+ 
++#if defined(_POSIX_MAPPED_FILES) && defined(__linux__)
++// Whether reading a whole file in up front (MAP_POPULATE, MADV_WILLNEED)
++// fits in the memory available. A model larger than that is read in full
++// while evicting its own pages, and on Android the low-memory killer ends the
++// process; left unpopulated, pages are read when first touched, which also
++// lets a mixture-of-experts model stream its experts from storage.
++// LLAMA_MMAP_PREFETCH=0 or 1 forces either.
++static bool llama_mmap_prefetch_fits(size_t size) {
++    if (const char * env = getenv("LLAMA_MMAP_PREFETCH")) {
++        return strcmp(env, "0") != 0;
++    }
++    FILE * f = fopen("/proc/meminfo", "r");
++    if (!f) {
++        return true;
++    }
++    char line[256];
++    unsigned long long avail_kb = 0;
++    bool found = false;
++    while (fgets(line, sizeof(line), f)) {
++        if (sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) {
++            found = true;
++            break;
++        }
++    }
++    fclose(f);
++    if (!found) {
++        return true;
++    }
++    // keep a margin for the context, compute buffers and everything else
++    const unsigned long long margin = 512ull * 1024 * 1024;
++    return (unsigned long long) size + margin <= avail_kb * 1024;
++}
++#endif
++
+ struct llama_mmap::impl {
+ #ifdef _POSIX_MAPPED_FILES
+     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+@@ -472,7 +506,14 @@
+         int flags = MAP_SHARED;
+         if (numa) { prefetch = 0; }
+ #ifdef __linux__
+-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
++        if (prefetch && !llama_mmap_prefetch_fits(file->size())) {
++            LLAMA_LOG_INFO("%s: %zu MiB is more than the memory available: pages are read when first used\n",
++                    __func__, file->size() / 1024 / 1024);
++            prefetch = 0;
++        }
++        // sequential readahead suits the up-front read, not the scattered
++        // expert reads of a model left unpopulated
++        if (prefetch && posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                     strerror(errno));
+         }
+@@ -492,22 +533,22 @@
              if (beg >= end) {
                  return;
              }

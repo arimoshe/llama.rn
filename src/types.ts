@@ -136,6 +136,20 @@ export type NativeContextParams = {
   no_extra_bufts?: boolean
 
   /**
+   * Stream a mixture-of-experts model's expert weights from the mapped model
+   * file through a CPU cache of this many MB (fork addition). Expert tensors
+   * stay in the mapping; the other weights load as usual. 0 or unset: off.
+   */
+  expert_cache_mb?: number
+
+  /**
+   * With expert_cache_mb: a file the cache rewrites with its counters (JSON:
+   * hits, misses, passthrough, readMb, usedMb, budgetMb) at the start of each
+   * pass through the model (fork addition).
+   */
+  expert_cache_stats_file?: string
+
+  /**
    * Single LoRA adapter path
    */
   lora?: string

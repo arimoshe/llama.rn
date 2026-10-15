@@ -1,0 +1,15 @@
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -147,6 +147,12 @@ extern "C" {
+     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
+     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
+ 
++    // Expert cache for mixture-of-experts weights read from a mapped file,
++    // enabled by LLAMA_EXPERT_CACHE_MB (see ggml-cpu.c). Clear frees every
++    // cached slice; a model's are stale once it is freed.
++    GGML_BACKEND_API void ggml_cpu_expert_cache_clear(void);
++    GGML_BACKEND_API void ggml_cpu_expert_cache_stats(uint64_t * hits, uint64_t * misses, size_t * used, size_t * budget);
++
+ #ifdef __cplusplus
+ }
+ #endif

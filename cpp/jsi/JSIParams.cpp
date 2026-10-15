@@ -5,6 +5,7 @@
 #include "speculative.h"
 #endif
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <list>
 #include <thread>
@@ -354,6 +355,25 @@ static common_grammar makeGrammar(common_grammar_type type, std::string grammar)
             cparams.load_mode = LLAMA_LOAD_MODE_NONE;
         }
         cparams.no_extra_bufts = getPropertyAsBool(params, "no_extra_bufts", cparams.no_extra_bufts);
+
+        // Mixture-of-experts weights streamed from the mapped model file
+        // through the CPU expert cache (ggml-cpu.c), which reads these at
+        // load and on every expert op. Process-wide: a load without them
+        // turns the cache off again.
+        {
+            int expertCacheMb = getPropertyAsInt(params, "expert_cache_mb", 0);
+            if (expertCacheMb > 0) {
+                setenv("LLAMA_EXPERT_CACHE_MB", std::to_string(expertCacheMb).c_str(), 1);
+            } else {
+                unsetenv("LLAMA_EXPERT_CACHE_MB");
+            }
+            std::string statsFile = getPropertyAsString(params, "expert_cache_stats_file");
+            if (expertCacheMb > 0 && !statsFile.empty()) {
+                setenv("LLAMA_EXPERT_CACHE_STATS_FILE", statsFile.c_str(), 1);
+            } else {
+                unsetenv("LLAMA_EXPERT_CACHE_STATS_FILE");
+            }
+        }
 
         if (hasProperty(params, "flash_attn")) {
             bool fa = getPropertyAsBool(params, "flash_attn", false);
