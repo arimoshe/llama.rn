@@ -1483,7 +1483,10 @@ UseGgmlGemm2:;
 //
 // Slices are read with pread from the file behind the mapping (found in
 // /proc/self/maps), one large read each, after posix_fadvise(WILLNEED) has
-// queued them all, and their page cache is dropped once copied. Copying out
+// queued them all, and their page cache is dropped once copied. The op's
+// first thread decides what to read and allocates; every thread of the op
+// then reads its share (ggml_ec_run_reads), so the reads run in parallel
+// instead of one after another while the other threads wait. Copying out
 // of the mapping instead faults it in a page at a time once readahead is
 // off: on a phone, 1.26 million faults of ~7 KB for 9 GB, at 0.4 tok/s.
 // Prompt processing reads its pass-through slices the same way, into
@@ -1543,6 +1546,12 @@ static struct {
 static struct { const void * p; size_t n; void * buf; } g_ec_pending[GGML_EC_MAX_PENDING];
 static int g_ec_n_pending;
 
+// Reads the current op needs, filled by ggml_ec_prepare and done by every
+// thread of the op (ggml_ec_run_reads) before any of them computes.
+#define GGML_EC_MAX_READS 1024
+static struct { const struct ggml_ec_tensor * t; int a; void * dst; } g_ec_reads[GGML_EC_MAX_READS];
+static int g_ec_n_reads;
+
 // files behind the expert mappings, opened once each
 #define GGML_EC_MAX_FILES 16
 static struct { char path[512]; int fd; } g_ec_files[GGML_EC_MAX_FILES];
@@ -1550,6 +1559,7 @@ static int g_ec_n_files;
 
 // for the stats file (ggml_ec_write_stats)
 static int g_ec_last_layer = -1;
+static int g_ec_n_layers;   // highest layer seen + 1
 static uint64_t g_ec_read_bytes, g_ec_passthrough;
 
 static size_t ggml_ec_page(void) {
@@ -1607,7 +1617,9 @@ static size_t ggml_ec_mem_available(void) {
 
 // Left free beside the cache: the app, the slices a prompt passes through,
 // page cache in flight and everything else on the phone.
-#define GGML_EC_RESERVE ((size_t) 1280 * 1024 * 1024)
+// 1.25 GB still swapped on a phone (the cache faulted back in from zram
+// mid-benchmark at 1.6 GB free).
+#define GGML_EC_RESERVE ((size_t) 2048 * 1024 * 1024)
 #define GGML_EC_MIN     ((size_t)  256 * 1024 * 1024)
 
 // The requested budget capped at what is available now, the cache's own
@@ -1721,6 +1733,28 @@ static void ggml_ec_load(const struct ggml_ec_tensor * t, int a, void * dst) {
     }
 }
 
+// queues the read of expert a's slice into dst for the op's threads; read
+// at once when the queue is full
+static void ggml_ec_queue(const struct ggml_ec_tensor * t, int a, void * dst) {
+    if (g_ec_n_reads < GGML_EC_MAX_READS) {
+        g_ec_reads[g_ec_n_reads].t   = t;
+        g_ec_reads[g_ec_n_reads].a   = a;
+        g_ec_reads[g_ec_n_reads].dst = dst;
+        g_ec_n_reads++;
+    } else {
+        ggml_ec_load(t, a, dst);
+    }
+}
+
+// Thread ith of nth does its share of the queued reads. Every thread of the
+// op calls it after the barrier that follows ggml_ec_prepare, and they meet
+// at another barrier before computing.
+static void ggml_ec_run_reads(int ith, int nth) {
+    for (int i = ith; i < g_ec_n_reads; i += nth) {
+        ggml_ec_load(g_ec_reads[i].t, g_ec_reads[i].a, g_ec_reads[i].dst);
+    }
+}
+
 static void ggml_ec_free_tensor(struct ggml_ec_tensor * t) {
     for (int i = 0; i < t->n; i++) {
         if (t->e[i].data) {
@@ -1750,6 +1784,7 @@ void ggml_cpu_expert_cache_clear(void) {
     }
     g_ec_n_files = 0;
     g_ec_last_layer = -1;
+    g_ec_n_layers = 0;
     g_ec_read_bytes = g_ec_passthrough = 0;
     ggml_critical_section_end();
 }
@@ -1834,8 +1869,10 @@ static void ggml_ec_release_pending(void) {
 }
 
 // Counters for the app's log, written to LLAMA_EXPERT_CACHE_STATS_FILE at
-// the start of each pass through the model.
-static void ggml_ec_write_stats(void) {
+// the start of each pass through the model, and at each layer of a prompt's
+// pass so the app can show how far through the model a long prefill is:
+// layer (0-based) of layers, on a batch of `tokens`.
+static void ggml_ec_write_stats(int layer, int64_t tokens) {
     const char * path = getenv("LLAMA_EXPERT_CACHE_STATS_FILE");
     if (!path) {
         return;
@@ -1851,10 +1888,12 @@ static void ggml_ec_write_stats(void) {
         pread_tensors += g_ec.t[i].fd >= 0;
     }
     fprintf(f, "{\"hits\":%llu,\"misses\":%llu,\"passthrough\":%llu,\"readMb\":%.1f,\"usedMb\":%.1f,\"budgetMb\":%.1f,"
-               "\"requestedMb\":%.1f,\"availMb\":%.1f,\"tensors\":%d,\"preadTensors\":%d}\n",
+               "\"requestedMb\":%.1f,\"availMb\":%.1f,\"tensors\":%d,\"preadTensors\":%d,"
+               "\"layer\":%d,\"layers\":%d,\"tokens\":%lld}\n",
             (unsigned long long) g_ec.hits, (unsigned long long) g_ec.misses, (unsigned long long) g_ec_passthrough,
             g_ec_read_bytes / 1048576.0, g_ec.used / 1048576.0, g_ec.budget / 1048576.0,
-            g_ec.requested / 1048576.0, g_ec.avail / 1048576.0, g_ec.n_tensors, pread_tensors);
+            g_ec.requested / 1048576.0, g_ec.avail / 1048576.0, g_ec.n_tensors, pread_tensors,
+            layer, g_ec_n_layers, (long long) tokens);
     fclose(f);
     rename(tmp, path);
 }
@@ -1889,14 +1928,19 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
         ggml_ec_make_room(0);
     }
     ggml_ec_release_pending();
+    g_ec_n_reads = 0;
     struct ggml_ec_tensor * t = ggml_ec_find(src0, true);
     if (!t) {
         ggml_critical_section_end();
         return false;
     }
     if (t->layer >= 0) {
-        if (t->layer < g_ec_last_layer) {
-            ggml_ec_write_stats();
+        if (t->layer + 1 > g_ec_n_layers) {
+            g_ec_n_layers = t->layer + 1;
+        }
+        if (t->layer < g_ec_last_layer ||
+            (t->layer > g_ec_last_layer && n_tokens > GGML_EC_PASSTHROUGH_TOKENS)) {
+            ggml_ec_write_stats(t->layer, n_tokens);
         }
         g_ec_last_layer = t->layer;
     }
@@ -1948,9 +1992,8 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
             g_ec_read_bytes += t->slice;
             if (g_ec_n_pending < GGML_EC_MAX_PENDING) {
                 void * buf = t->fd >= 0 ? malloc(t->slice) : NULL;
-                if (buf && !ggml_ec_read(t, a, buf)) {
-                    free(buf);
-                    buf = NULL;
+                if (buf) {
+                    ggml_ec_queue(t, a, buf);
                 }
                 g_ec_pending[g_ec_n_pending].p = mapped;
                 g_ec_pending[g_ec_n_pending].n = t->slice;
@@ -1969,7 +2012,7 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
             g_ec_read_bytes += t->slice;
             if ((passthrough || ggml_ec_make_room(t->slice)) && (e->data = malloc(t->slice)) != NULL) {
                 // the copy is what is read from now on
-                ggml_ec_load(t, a, e->data);
+                ggml_ec_queue(t, a, e->data);
                 g_ec.used += t->slice;
             }
         }
@@ -2207,6 +2250,14 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     ggml_barrier(params->threadpool);
+
+#ifdef GGML_EXPERT_CACHE
+    // the expert slices this op reads from storage, read by all its threads
+    if (expert_ptrs[0] && g_ec_n_reads > 0) {
+        ggml_ec_run_reads(ith, nth);
+        ggml_barrier(params->threadpool);
+    }
+#endif
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
