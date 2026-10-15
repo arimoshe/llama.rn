@@ -1,6 +1,6 @@
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -1467,6 +1467,337 @@ UseGgmlGemm2:;
+@@ -1467,6 +1467,532 @@ UseGgmlGemm2:;
      }
  }
  
@@ -17,9 +17,23 @@
 +// an LRU cache of whole expert slices with a fixed budget, and the matrix
 +// multiplication reads from the copies. Readahead is switched off for the
 +// expert tensors (MADV_RANDOM) and the mapped pages are dropped once copied.
++//
++// Slices are read with pread from the file behind the mapping (found in
++// /proc/self/maps), one large read each, after posix_fadvise(WILLNEED) has
++// queued them all, and their page cache is dropped once copied. Copying out
++// of the mapping instead faults it in a page at a time once readahead is
++// off: on a phone, 1.26 million faults of ~7 KB for 9 GB, at 0.4 tok/s.
++// Prompt processing reads its pass-through slices the same way, into
++// buffers freed at the next op.
++//
++// The budget is LLAMA_EXPERT_CACHE_MB, capped when the cache is first used
++// (the model, context and compute buffers allocated by then) at the memory
++// still available less a reserve: a budget past that pushes the process
++// into swap and the low-memory killer.
 +
 +#if defined(__linux__)
 +#include <sys/mman.h>
++#include <fcntl.h>
 +#include <unistd.h>
 +#define GGML_EXPERT_CACHE 1
 +#endif
@@ -38,6 +52,8 @@
 +    size_t       slice;  // bytes per expert
 +    int          n;      // experts
 +    int          layer;  // from the name "blk.N.ffn_*_exps", -1 if none
++    int          fd;     // the mapped file, read with pread; -1: copy from the mapping
++    int64_t      off;    // file offset of base
 +    struct ggml_ec_entry * e;
 +};
 +
@@ -45,6 +61,8 @@
 +
 +static struct {
 +    size_t   budget;
++    size_t   requested; // LLAMA_EXPERT_CACHE_MB, the budget before the cap
++    size_t   avail;     // MemAvailable when the budget was set
 +    size_t   used;
 +    uint64_t tick;
 +    uint64_t serial;
@@ -57,8 +75,15 @@
 +// at the next prepare: by then every thread is past that op (ggml-cpu runs a
 +// barrier between nodes).
 +#define GGML_EC_MAX_PENDING 1024
-+static struct { const void * p; size_t n; } g_ec_pending[GGML_EC_MAX_PENDING];
++// `buf` is set when the slice was read into a buffer of its own (freed then),
++// else the mapped bytes are advised away.
++static struct { const void * p; size_t n; void * buf; } g_ec_pending[GGML_EC_MAX_PENDING];
 +static int g_ec_n_pending;
++
++// files behind the expert mappings, opened once each
++#define GGML_EC_MAX_FILES 16
++static struct { char path[512]; int fd; } g_ec_files[GGML_EC_MAX_FILES];
++static int g_ec_n_files;
 +
 +// for the stats file (ggml_ec_write_stats)
 +static int g_ec_last_layer = -1;
@@ -100,6 +125,139 @@
 +    return mb > 0 ? (size_t) mb * 1024 * 1024 : 0;
 +}
 +
++// MemAvailable in bytes, 0 if unknown
++static size_t ggml_ec_mem_available(void) {
++    FILE * f = fopen("/proc/meminfo", "r");
++    if (!f) {
++        return 0;
++    }
++    char line[256];
++    unsigned long long kb = 0;
++    while (fgets(line, sizeof(line), f)) {
++        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
++            break;
++        }
++    }
++    fclose(f);
++    return (size_t) kb * 1024;
++}
++
++// Left free beside the cache: the app, the slices a prompt passes through,
++// page cache in flight and everything else on the phone.
++#define GGML_EC_RESERVE ((size_t) 1280 * 1024 * 1024)
++#define GGML_EC_MIN     ((size_t)  256 * 1024 * 1024)
++
++// The requested budget capped at what is available now, the cache's own
++// slices counted as available (they are what it would give back).
++// LLAMA_EXPERT_CACHE_NO_CAP=1 keeps the requested budget.
++static size_t ggml_ec_effective_budget(size_t requested) {
++    const char * nocap = getenv("LLAMA_EXPERT_CACHE_NO_CAP");
++    if (nocap && strcmp(nocap, "0") != 0) {
++        g_ec.avail = 0;
++        return requested;
++    }
++    const size_t avail = ggml_ec_mem_available();
++    g_ec.avail = avail;
++    if (avail == 0) {
++        return requested;
++    }
++    const size_t room = avail + g_ec.used > GGML_EC_RESERVE ? avail + g_ec.used - GGML_EC_RESERVE : 0;
++    size_t budget = requested < room ? requested : room;
++    if (budget < GGML_EC_MIN) {
++        budget = requested < GGML_EC_MIN ? requested : GGML_EC_MIN;
++    }
++    if (budget != requested) {
++        GGML_LOG_INFO("%s: expert cache %zu MiB (asked %zu MiB, %zu MiB available)\n", __func__,
++                budget >> 20, requested >> 20, avail >> 20);
++    }
++    return budget;
++}
++
++// The file and offset behind a mapped address, from /proc/self/maps.
++static int ggml_ec_file_of(const void * addr, int64_t * off) {
++    FILE * f = fopen("/proc/self/maps", "r");
++    if (!f) {
++        return -1;
++    }
++    char line[1024];
++    char path[512];
++    int fd = -1;
++    const uintptr_t a = (uintptr_t) addr;
++    while (fgets(line, sizeof(line), f)) {
++        unsigned long long beg, end, moff;
++        path[0] = 0;
++        if (sscanf(line, "%llx-%llx %*s %llx %*s %*s %511s", &beg, &end, &moff, path) < 3) {
++            continue;
++        }
++        if (a < beg || a >= end) {
++            continue;
++        }
++        if (path[0] != '/') {
++            break; // anonymous: a copy, not a mapping
++        }
++        for (int i = 0; i < g_ec_n_files; i++) {
++            if (strcmp(g_ec_files[i].path, path) == 0) {
++                fd = g_ec_files[i].fd;
++            }
++        }
++        if (fd < 0 && g_ec_n_files < GGML_EC_MAX_FILES) {
++            fd = open(path, O_RDONLY | O_CLOEXEC);
++            if (fd >= 0) {
++                snprintf(g_ec_files[g_ec_n_files].path, sizeof(g_ec_files[0].path), "%s", path);
++                g_ec_files[g_ec_n_files].fd = fd;
++                g_ec_n_files++;
++            }
++        }
++        *off = (int64_t) (a - beg + moff);
++        break;
++    }
++    fclose(f);
++    return fd;
++}
++
++static void ggml_ec_fadvise(const struct ggml_ec_tensor * t, size_t at, size_t n, int advice) {
++    posix_fadvise(t->fd, (off_t) (t->off + (int64_t) at), (off_t) n, advice);
++}
++
++// queues the read of [at, at + n) of the tensor
++static void ggml_ec_prefetch(const struct ggml_ec_tensor * t, size_t at, size_t n) {
++    if (t->fd >= 0) {
++        ggml_ec_fadvise(t, at, n, POSIX_FADV_WILLNEED);
++    } else {
++        ggml_ec_willneed((const char *) t->base + at, n);
++    }
++}
++
++// Reads expert a's slice into dst, then drops its page cache; false on a
++// failed read (dst then holds nothing useful) or without a file.
++static bool ggml_ec_read(const struct ggml_ec_tensor * t, int a, void * dst) {
++    if (t->fd < 0) {
++        return false;
++    }
++    size_t done = 0;
++    while (done < t->slice) {
++        ssize_t r = pread(t->fd, (char *) dst + done, t->slice - done, (off_t) (t->off + (int64_t) (a*t->slice + done)));
++        if (r <= 0) {
++            if (r < 0 && errno == EINTR) {
++                continue;
++            }
++            return false;
++        }
++        done += (size_t) r;
++    }
++    ggml_ec_fadvise(t, a*t->slice, t->slice, POSIX_FADV_DONTNEED);
++    return true;
++}
++
++// expert a's slice into dst, by pread or else from the mapping
++static void ggml_ec_load(const struct ggml_ec_tensor * t, int a, void * dst) {
++    if (!ggml_ec_read(t, a, dst)) {
++        const char * mapped = (const char *) t->base + a*t->slice;
++        memcpy(dst, mapped, t->slice);
++        ggml_ec_advise(mapped, t->slice, MADV_DONTNEED);
++    }
++}
++
 +static void ggml_ec_free_tensor(struct ggml_ec_tensor * t) {
 +    for (int i = 0; i < t->n; i++) {
 +        if (t->e[i].data) {
@@ -118,8 +276,16 @@
 +    }
 +    g_ec.n_tensors = 0;
 +    g_ec.used = 0;
++    g_ec.budget = g_ec.requested = 0;
 +    g_ec.hits = g_ec.misses = 0;
++    for (int i = 0; i < g_ec_n_pending; i++) {
++        free(g_ec_pending[i].buf);
++    }
 +    g_ec_n_pending = 0;
++    for (int i = 0; i < g_ec_n_files; i++) {
++        close(g_ec_files[i].fd);
++    }
++    g_ec_n_files = 0;
 +    g_ec_last_layer = -1;
 +    g_ec_read_bytes = g_ec_passthrough = 0;
 +    ggml_critical_section_end();
@@ -156,6 +322,8 @@
 +    if (sscanf(src0->name, "blk.%d.", &layer) == 1 && strstr(src0->name, "_exps") != NULL) {
 +        t->layer = layer;
 +    }
++    t->off = 0;
++    t->fd  = ggml_ec_file_of(src0->data, &t->off);
 +    g_ec.n_tensors++;
 +    // the cache decides what is read; the kernel's readahead would only
 +    // bring in neighbouring experts
@@ -193,7 +361,11 @@
 +
 +static void ggml_ec_release_pending(void) {
 +    for (int i = 0; i < g_ec_n_pending; i++) {
-+        ggml_ec_advise(g_ec_pending[i].p, g_ec_pending[i].n, MADV_DONTNEED);
++        if (g_ec_pending[i].buf) {
++            free(g_ec_pending[i].buf);
++        } else {
++            ggml_ec_advise(g_ec_pending[i].p, g_ec_pending[i].n, MADV_DONTNEED);
++        }
 +    }
 +    g_ec_n_pending = 0;
 +}
@@ -211,9 +383,15 @@
 +    if (!f) {
 +        return;
 +    }
-+    fprintf(f, "{\"hits\":%llu,\"misses\":%llu,\"passthrough\":%llu,\"readMb\":%.1f,\"usedMb\":%.1f,\"budgetMb\":%.1f,\"tensors\":%d}\n",
++    int pread_tensors = 0;
++    for (int i = 0; i < g_ec.n_tensors; i++) {
++        pread_tensors += g_ec.t[i].fd >= 0;
++    }
++    fprintf(f, "{\"hits\":%llu,\"misses\":%llu,\"passthrough\":%llu,\"readMb\":%.1f,\"usedMb\":%.1f,\"budgetMb\":%.1f,"
++               "\"requestedMb\":%.1f,\"availMb\":%.1f,\"tensors\":%d,\"preadTensors\":%d}\n",
 +            (unsigned long long) g_ec.hits, (unsigned long long) g_ec.misses, (unsigned long long) g_ec_passthrough,
-+            g_ec_read_bytes / 1048576.0, g_ec.used / 1048576.0, g_ec.budget / 1048576.0, g_ec.n_tensors);
++            g_ec_read_bytes / 1048576.0, g_ec.used / 1048576.0, g_ec.budget / 1048576.0,
++            g_ec.requested / 1048576.0, g_ec.avail / 1048576.0, g_ec.n_tensors, pread_tensors);
 +    fclose(f);
 +    rename(tmp, path);
 +}
@@ -240,7 +418,13 @@
 +    }
 +
 +    ggml_critical_section_start();
-+    g_ec.budget = budget;
++    if (budget != g_ec.requested) {
++        // first use since load (or a new request): everything else is
++        // allocated by now
++        g_ec.requested = budget;
++        g_ec.budget = ggml_ec_effective_budget(budget);
++        ggml_ec_make_room(0);
++    }
 +    ggml_ec_release_pending();
 +    struct ggml_ec_tensor * t = ggml_ec_find(src0, true);
 +    if (!t) {
@@ -265,7 +449,7 @@
 +        }
 +        t->e[a].pin = serial;
 +        if (!t->e[a].data) {
-+            ggml_ec_willneed((const char *) t->base + a*t->slice, t->slice);
++            ggml_ec_prefetch(t, a*t->slice, t->slice);
 +        }
 +    }
 +    for (int i = 0; t->layer >= 0 && i < g_ec.n_tensors; i++) {
@@ -276,13 +460,13 @@
 +        if (s->layer == t->layer) {
 +            for (int a = 0; a < n_as; a++) {
 +                if (counts[a] > 0 && !s->e[a].data) {
-+                    ggml_ec_willneed((const char *) s->base + a*s->slice, s->slice);
++                    ggml_ec_prefetch(s, a*s->slice, s->slice);
 +                }
 +            }
 +        } else if (passthrough && s->layer == t->layer + 1) {
 +            // prompt processing needs nearly all of the next layer too: read
 +            // it while this one computes
-+            ggml_ec_willneed(s->base, s->slice * (size_t) s->n);
++            ggml_ec_prefetch(s, 0, s->slice * (size_t) s->n);
 +        }
 +    }
 +
@@ -295,13 +479,25 @@
 +        if (e->data) {
 +            g_ec.hits++;
 +        } else if (passthrough && g_ec.used + t->slice > g_ec.budget) {
-+            // no room without evicting: read from the mapping this once
++            // no room without evicting: read this once, into a buffer
++            // freed at the next op (or straight from the mapping)
 +            g_ec_passthrough++;
 +            g_ec_read_bytes += t->slice;
 +            if (g_ec_n_pending < GGML_EC_MAX_PENDING) {
++                void * buf = t->fd >= 0 ? malloc(t->slice) : NULL;
++                if (buf && !ggml_ec_read(t, a, buf)) {
++                    free(buf);
++                    buf = NULL;
++                }
 +                g_ec_pending[g_ec_n_pending].p = mapped;
 +                g_ec_pending[g_ec_n_pending].n = t->slice;
++                g_ec_pending[g_ec_n_pending].buf = buf;
 +                g_ec_n_pending++;
++                if (buf) {
++                    e->used = ++g_ec.tick;
++                    ptrs[a] = (const char *) buf;
++                    continue;
++                }
 +            }
 +        } else {
 +            // generation evicts the least recently used; prompt processing
@@ -309,10 +505,9 @@
 +            g_ec.misses++;
 +            g_ec_read_bytes += t->slice;
 +            if ((passthrough || ggml_ec_make_room(t->slice)) && (e->data = malloc(t->slice)) != NULL) {
-+                memcpy(e->data, mapped, t->slice);
-+                g_ec.used += t->slice;
 +                // the copy is what is read from now on
-+                ggml_ec_advise(mapped, t->slice, MADV_DONTNEED);
++                ggml_ec_load(t, a, e->data);
++                g_ec.used += t->slice;
 +            }
 +        }
 +        e->used = ++g_ec.tick;
@@ -338,7 +533,7 @@
  // ggml_compute_forward_mul_mat_id
  
  #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
-@@ -1596,9 +1927,14 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1596,9 +2122,14 @@ static void ggml_compute_forward_mul_mat_id(
      char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
          incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
  
@@ -354,7 +549,7 @@
  
      char * iqp_panels = NULL;
  
-@@ -1660,6 +1996,13 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1660,6 +2191,13 @@ static void ggml_compute_forward_mul_mat_id(
                  matrix_row_counts[i02] += 1;
              }
          }
@@ -368,7 +563,7 @@
      }
  
      // reset current_chunk
-@@ -1684,7 +2027,7 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1684,7 +2222,7 @@ static void ggml_compute_forward_mul_mat_id(
              continue;
          }
  
@@ -377,7 +572,7 @@
          const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
-@@ -2915,6 +3258,8 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2915,6 +3453,8 @@ struct ggml_cplan ggml_graph_plan(
                          cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                          // atomic_current_chunk
                          cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
