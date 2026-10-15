@@ -1,0 +1,102 @@
+name: SD1.5 PixelArtRedmond for the 8 Elite NPU
+
+# Stable Diffusion 1.5 with the PixelArtRedmond 1.5 LoRA fused in, quantized
+# w8a16 and compiled by Qualcomm AI Hub for the Snapdragon 8 Elite for Galaxy
+# (precompiled QNN ONNX), for AIDungeonMaster's image test. The LoRA changes
+# only the UNet, so only the UNet is rebuilt: the app keeps Qualcomm's stock
+# text encoder and VAE for the same chip.
+#
+#   merge.py          fuse the LoRA into SD1.5 (diffusers layout)
+#   quantize_unet.py  calibrate and quantize the UNet with AIMET
+#                     (qai_hub_models' recipe), on prompts.txt
+#   export            compile on AI Hub (QAI_HUB_API_TOKEN secret)
+#   package.py        unet.onnx + unet.bin + metadata.json, then a release
+#
+# config.env sets the calibration size and whether to publish. A push to this
+# branch runs it (workflow_dispatch only works on the default branch).
+
+on:
+  push:
+    branches: [sd15-pixel-npu]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sd15-pixel-npu
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      QAIHM_STORE_ROOT: /mnt/work
+      HF_HOME: /mnt/work/hf
+      PIP_NO_CACHE_DIR: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scratch disk and swap
+        # Qualcomm asks for 32 GB of RAM to quantize SD; the runner has 16,
+        # so 16 GB of swap on the larger /mnt disk covers the peaks.
+        run: |
+          sudo mkdir -p /mnt/work && sudo chown "$USER" /mnt/work
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          free -g; df -h / /mnt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.11.0"
+          pip install "qai-hub-models==0.64.0" "aimet-onnx==2.28.0" "diffusers==0.35.2" \
+            "transformers==4.56.2" "onnx>=1.17,<=1.18.0" "onnxsim<=0.4.36" "peft==0.17.1" accelerate
+          pip list | grep -iE "torch|aimet|diffusers|transformers|onnx|qai|peft"
+
+      - name: Fuse the LoRA
+        run: |
+          python merge.py /mnt/work/merged
+          # qai-hub-models 0.64.0 recognizes a local checkpoint folder only
+          # by these names
+          for d in unet text_encoder vae; do
+            (cd /mnt/work/merged/$d && ln -sf config.json config.yaml && ln -sf "$(ls *.safetensors | head -1)" model.safetensor)
+          done
+
+      - name: Calibrate and quantize the UNet
+        run: |
+          source config.env
+          echo "calibration: $SAMPLES prompts x $STEPS steps"
+          python quantize_unet.py --checkpoint /mnt/work/merged -o /mnt/work/pixel \
+            --num-samples "$SAMPLES" --num-steps "$STEPS" --prompt prompts.txt --host-device cpu
+          find /mnt/work/pixel -maxdepth 3 -exec ls -ld {} \;
+
+      - name: Compile on Qualcomm AI Hub
+        env:
+          QAI_HUB_API_TOKEN: ${{ secrets.QAI_HUB_API_TOKEN }}
+        run: |
+          if [ -z "$QAI_HUB_API_TOKEN" ]; then echo "::error::QAI_HUB_API_TOKEN secret is not set"; exit 1; fi
+          qai-hub configure --api_token "$QAI_HUB_API_TOKEN" > /dev/null
+          qai-hub-models export stable_diffusion_v1_5 --checkpoint /mnt/work/pixel --components unet \
+            --target-runtime precompiled_qnn_onnx --skip-profiling --skip-inferencing \
+            --output-dir /mnt/work/export
+          find /mnt/work/export -maxdepth 5 -exec ls -ld {} \;
+
+      - name: Package
+        run: python package.py /mnt/work/export /mnt/work/release
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source config.env
+          if [ "$PUBLISH" != "1" ]; then echo "PUBLISH=0: built, not published"; exit 0; fi
+          if gh release view "$TAG" > /dev/null 2>&1; then echo "::error::release $TAG exists; never replaced"; exit 1; fi
+          cp LICENSE-NOTICE.md /mnt/work/release/
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file LICENSE-NOTICE.md \
+            /mnt/work/release/unet.onnx /mnt/work/release/unet.bin /mnt/work/release/metadata.json \
+            /mnt/work/release/SHA256SUMS /mnt/work/release/LICENSE-NOTICE.md
