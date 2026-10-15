@@ -53,9 +53,13 @@ jobs:
 
       - name: Install
         run: |
-          pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.11.0"
+          # CPU torch (no CUDA wheels); the rest pinned to the set that ran
+          # the same scripts locally
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.11.0" "torchvision==0.26.0"
           pip install "qai-hub-models==0.64.0" "aimet-onnx==2.28.0" "diffusers==0.35.2" \
-            "transformers==4.56.2" "onnx>=1.17,<=1.18.0" "onnxsim<=0.4.36" "peft==0.17.1" accelerate
+            "transformers==4.56.2" "onnx>=1.17,<=1.18.0" "onnxsim<=0.4.36" "peft==0.17.1" \
+            "accelerate==1.15.0" "huggingface_hub==0.36.2" "pillow==11.3.0" "safetensors==0.8.0"
+          python -c "from diffusers import StableDiffusionPipeline; import aimet_onnx; print('imports ok')"
           pip list | grep -iE "torch|aimet|diffusers|transformers|onnx|qai|peft"
 
       - name: Fuse the LoRA
