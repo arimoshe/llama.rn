@@ -9,7 +9,7 @@ name: SD1.5 PixelArtRedmond for the 8 Elite NPU
 #   merge.py          fuse the LoRA into SD1.5 (diffusers layout)
 #   quantize_unet.py  calibrate and quantize the UNet with AIMET
 #                     (qai_hub_models' recipe), on prompts.txt
-#   export            compile on AI Hub (QAI_HUB_API_TOKEN secret)
+#   export_unet.py    compile on AI Hub (QAI_HUB_API_TOKEN secret)
 #   package.py        unet.onnx + unet.bin + metadata.json, then a release
 #
 # config.env sets the calibration size and whether to publish. A push to this
@@ -77,11 +77,6 @@ jobs:
           echo "calibration: $SAMPLES prompts x $STEPS steps"
           python quantize_unet.py --checkpoint /mnt/work/merged -o /mnt/work/pixel \
             --num-samples "$SAMPLES" --num-steps "$STEPS" --prompt prompts.txt --host-device cpu
-          # export builds the whole pipeline even for --components unet: the
-          # text encoder and VAE load from the merged float weights (the LoRA
-          # left them as stock SD1.5) and are not compiled
-          ln -s /mnt/work/merged/text_encoder /mnt/work/pixel/text_encoder
-          ln -s /mnt/work/merged/vae /mnt/work/pixel/vae
           find /mnt/work/pixel -maxdepth 3 -exec ls -ld {} \;
 
       - name: Compile on Qualcomm AI Hub
@@ -90,7 +85,9 @@ jobs:
         run: |
           if [ -z "$QAI_HUB_API_TOKEN" ]; then echo "::error::QAI_HUB_API_TOKEN secret is not set"; exit 1; fi
           qai-hub configure --api_token "$QAI_HUB_API_TOKEN" > /dev/null
-          qai-hub-models export stable_diffusion_v1_5 --checkpoint /mnt/work/pixel --components unet \
+          # export_unet.py: the CLI's export, with Qualcomm's stock text
+          # encoder and VAE in the pipeline it builds
+          python export_unet.py --checkpoint /mnt/work/pixel --components unet \
             --target-runtime precompiled_qnn_onnx --skip-profiling --skip-inferencing \
             --output-dir /mnt/work/export
           find /mnt/work/export -maxdepth 5 -exec ls -ld {} \;
