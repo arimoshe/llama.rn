@@ -1,0 +1,34 @@
+# Scenes for calibration, each drawn with one of the characters as the
+# IP-Adapter reference, in the app's scene prompt shape.
+a person exploring a dark forest at night, glowing mushrooms, game scene, detailed, pixel art, PixArFK
+a person sitting in a crowded tavern by the fireplace, game scene, detailed, pixel art, PixArFK
+a person fighting a skeleton warrior in a dungeon corridor, game scene, detailed, pixel art, PixArFK
+a person standing on a ship deck in a storm, game scene, detailed, pixel art, PixArFK
+a person walking through a desert town at sunset, game scene, detailed, pixel art, PixArFK
+a person in a snowy mountain village, game scene, detailed, pixel art, PixArFK
+a person exploring a haunted graveyard in the fog, game scene, detailed, pixel art, PixArFK
+a person on the bridge of a starship, stars outside the window, game scene, detailed, pixel art, PixArFK
+a person in a neon lit city street in the rain, game scene, detailed, pixel art, PixArFK
+a person opening a treasure chest in a cave, game scene, detailed, pixel art, PixArFK
+a person talking to a merchant at a market stall, game scene, detailed, pixel art, PixArFK
+a person crossing a rope bridge over a canyon, game scene, detailed, pixel art, PixArFK
+a person resting by a campfire under the stars, game scene, detailed, pixel art, PixArFK
+a person facing a red dragon in a ruined castle, game scene, detailed, pixel art, PixArFK
+a person reading in a library full of glowing books, game scene, detailed, pixel art, PixArFK
+a person standing at the gate of a walled city, game scene, detailed, pixel art, PixArFK
+a person swimming in an underwater ruin, game scene, detailed, pixel art, PixArFK
+a person in a throne room before a king, game scene, detailed, pixel art, PixArFK
+a person sneaking through a guard tower at night, game scene, detailed, pixel art, PixArFK
+a person in a wizard tower full of potions, game scene, detailed, pixel art, PixArFK
+a person riding a horse across green hills, game scene, detailed, pixel art, PixArFK
+a person in a space station corridor with red alarm lights, game scene, detailed, pixel art, PixArFK
+a person fishing at a calm lake at dawn, game scene, detailed, pixel art, PixArFK
+a person fighting a giant spider in a cave, game scene, detailed, pixel art, PixArFK
+a person standing in a field of flowers, game scene, detailed, pixel art, PixArFK
+a person in a blacksmith forge with sparks flying, game scene, detailed, pixel art, PixArFK
+a person climbing a frozen waterfall, game scene, detailed, pixel art, PixArFK
+a person looking at a map in a war tent, game scene, detailed, pixel art, PixArFK
+a person in an alien jungle with strange plants, game scene, detailed, pixel art, PixArFK
+a person on a rooftop overlooking a city at night, game scene, detailed, pixel art, PixArFK
+a person at an ancient stone circle under a full moon, game scene, detailed, pixel art, PixArFK
+a person in a crowded port with sailing ships, game scene, detailed, pixel art, PixArFK

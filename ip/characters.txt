@@ -1,0 +1,18 @@
+# Character portraits for calibration and as IP-Adapter references, in the
+# PixelArtRedmond prompt shape the app uses (SpritePrompt.ts).
+a young woman with red hair in a green hooded cloak, holding a lantern, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+an old bearded wizard in a blue robe with a crooked staff, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a dwarf blacksmith with a braided beard and a leather apron, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a knight in silver plate armor with a red tabard, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+an elf archer in green leather with a longbow, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a hooded rogue in black with twin daggers, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a cyberpunk hacker with neon goggles and a purple jacket, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a starship captain in a white and gold uniform, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a desert nomad in sand colored wraps with a scarf over her face, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+an orc warrior with green skin and a huge axe, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a young monk in orange robes with a wooden staff, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a pirate captain with a tricorn hat and a red coat, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a necromancer in a dark purple cloak with a skull staff, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a girl with short blue hair in a yellow raincoat, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a robot companion with a round head and one glowing eye, game asset, single character, full body, front view, detailed, pixel art, PixArFK
+a bard with a feathered hat and a lute, game asset, single character, full body, front view, detailed, pixel art, PixArFK

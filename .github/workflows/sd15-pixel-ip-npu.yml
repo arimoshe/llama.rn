@@ -1,0 +1,172 @@
+name: SD1.5 PixelArtRedmond + IP-Adapter for the 8 Elite NPU
+
+# The pixel-art UNet (Liberte Redmond's, PixelArtRedmond fused in) with
+# IP-Adapter (h94/IP-Adapter ip-adapter_sd15), so a scene can keep the look of
+# a character drawn earlier, and IP-Adapter's image encoder (CLIP ViT-H), both
+# w8a16 and compiled by Qualcomm AI Hub for the Snapdragon 8 Elite for Galaxy
+# (precompiled QNN ONNX), for AIDungeonMaster. See ip/ip_unet.py. The UNet
+# takes ip_scale as an input: at 0 it is the plain pixel-art UNet.
+#
+#   calib    merge, then draw character portraits and scenes in full
+#            precision, recording every UNet input (ip/make_calib.py)
+#   encoder  image encoder: AI Hub quantize job on the portraits, compile
+#   unet     UNet: AIMET quantize on the recorded inputs, AI Hub compile
+#   publish  one release with both (ip/config.env)
+#
+# A push to this branch runs it.
+
+on:
+  push:
+    branches: [sd15-pixel-ip-npu]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sd15-pixel-ip-npu
+  cancel-in-progress: true
+
+env:
+  QAIHM_STORE_ROOT: /mnt/work
+  HF_HOME: /mnt/work/hf
+  PIP_NO_CACHE_DIR: "1"
+  IP_ADAPTER_WEIGHTS: /mnt/work/ip/models/ip-adapter_sd15.safetensors
+
+jobs:
+  calib:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Set up
+        run: ip/setup.sh
+      - name: Merge and fetch IP-Adapter
+        run: ip/fetch.sh
+      - name: Draw portraits and scenes, record the UNet's inputs
+        run: |
+          source ip/config.env
+          grep -v '^#' ip/characters.txt | head -n "$CHARACTERS" > /mnt/work/characters.txt
+          grep -v '^#' ip/scenes.txt | head -n "$SCENES" > /mnt/work/scenes.txt
+          python ip/make_calib.py /mnt/work/merged /mnt/work/ip /mnt/work/characters.txt /mnt/work/scenes.txt \
+            /mnt/work/calib "$STEPS"
+          ls -la /mnt/work/calib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calib
+          path: /mnt/work/calib
+          retention-days: 3
+
+  encoder:
+    needs: calib
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Set up
+        run: ip/setup.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: calib
+          path: /mnt/work/calib
+      - name: Build the image encoder on AI Hub
+        env:
+          QAI_HUB_API_TOKEN: ${{ secrets.QAI_HUB_API_TOKEN }}
+        run: |
+          qai-hub configure --api_token "$QAI_HUB_API_TOKEN" > /dev/null
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          for f in ["models/image_encoder/config.json", "models/image_encoder/model.safetensors"]:
+              hf_hub_download("h94/IP-Adapter", f, revision="018e402774aeeddd60609b4ecdb7e298259dc729", local_dir="/mnt/work/ip")
+          PY
+          python ip/build_image_encoder.py /mnt/work/ip/models/image_encoder /mnt/work/calib/portraits /mnt/work/enc
+          python package.py /mnt/work/enc/compiled /mnt/work/release image_encoder
+      - uses: actions/upload-artifact@v4
+        with:
+          name: encoder
+          path: /mnt/work/release
+          retention-days: 3
+
+  unet:
+    needs: calib
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Set up
+        run: ip/setup.sh
+      - name: Merge and fetch IP-Adapter
+        run: ip/fetch.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: calib
+          path: /mnt/work/calib
+      - name: Check the NPU-form UNet against diffusers
+        run: |
+          python ip/check_ip_unet.py /mnt/work/merged "$IP_ADAPTER_WEIGHTS" /mnt/work/ip/models/image_encoder \
+            /mnt/work/calib/portraits/000.png
+      - name: Quantize the UNet
+        run: |
+          python ip/quantize_ip_unet.py /mnt/work/merged /mnt/work/calib/unet_calib.pt /mnt/work/pixel
+          find /mnt/work/pixel -maxdepth 2 -exec ls -ld {} \;
+      - name: Compile on Qualcomm AI Hub
+        env:
+          QAI_HUB_API_TOKEN: ${{ secrets.QAI_HUB_API_TOKEN }}
+        run: |
+          qai-hub configure --api_token "$QAI_HUB_API_TOKEN" > /dev/null
+          python ip/export_ip_unet.py --checkpoint /mnt/work/pixel --components unet \
+            --target-runtime precompiled_qnn_onnx --skip-profiling --skip-inferencing \
+            --output-dir /mnt/work/export
+          python package.py /mnt/work/export /mnt/work/release unet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unet
+          path: /mnt/work/release
+          retention-days: 3
+
+  publish:
+    needs: [encoder, unet]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: unet
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: encoder
+          path: encoder
+      - name: Merge and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source ip/config.env
+          cp encoder/image_encoder.onnx encoder/image_encoder.bin release/
+          python3 - <<'PY'
+          import hashlib, json, os
+          meta = json.load(open("release/metadata.json"))
+          meta["model_files"].update(json.load(open("encoder/metadata.json"))["model_files"])
+          meta["model_id"] = "stable_diffusion_v1_5_liberte_pixelartredmond_ip_adapter"
+          json.dump(meta, open("release/metadata.json", "w"), indent=2)
+          with open("release/SHA256SUMS", "w") as f:
+              for n in sorted(os.listdir("release")):
+                  if n == "SHA256SUMS":
+                      continue
+                  h = hashlib.sha256(open(f"release/{n}", "rb").read()).hexdigest()
+                  f.write(f"{h}  {n}\n")
+          print(json.dumps(meta, indent=2))
+          PY
+          cat release/SHA256SUMS; ls -la release
+          if [ "$PUBLISH" != "1" ]; then echo "PUBLISH=0: built, not published"; exit 0; fi
+          if gh release view "$TAG" > /dev/null 2>&1; then echo "::error::release $TAG exists; never replaced"; exit 1; fi
+          cp ip/LICENSE-NOTICE.md release/
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file ip/LICENSE-NOTICE.md release/*
