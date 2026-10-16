@@ -38,14 +38,31 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Read the config
+        run: |
+          grep -E '^(CALIB_RUN_ID)=' ip/config.env >> "$GITHUB_ENV" || true
+          sudo mkdir -p /mnt/work && sudo chown "$USER" /mnt/work
+      # CALIB_RUN_ID: take that run's calibration data rather than drawing it
+      # again (3 h); artifacts are kept 3 days
+      - if: env.CALIB_RUN_ID != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: calib
+          path: /mnt/work/calib
+          run-id: ${{ env.CALIB_RUN_ID }}
+          github-token: ${{ github.token }}
+      - if: env.CALIB_RUN_ID == ''
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Set up
+      - if: env.CALIB_RUN_ID == ''
+        name: Set up
         run: ip/setup.sh
-      - name: Merge and fetch IP-Adapter
+      - if: env.CALIB_RUN_ID == ''
+        name: Merge and fetch IP-Adapter
         run: ip/fetch.sh
-      - name: Draw portraits and scenes, record the UNet's inputs
+      - if: env.CALIB_RUN_ID == ''
+        name: Draw portraits and scenes, record the UNet's inputs
         run: |
           source ip/config.env
           grep -v '^#' ip/characters.txt | head -n "$CHARACTERS" > /mnt/work/characters.txt
@@ -115,6 +132,8 @@ jobs:
             /mnt/work/calib/portraits/000.png
       - name: Quantize the UNet
         run: |
+          source ip/config.env
+          export QUANT_SAMPLES
           python ip/quantize_ip_unet.py /mnt/work/merged /mnt/work/calib/unet_calib.pt /mnt/work/pixel
           find /mnt/work/pixel -maxdepth 2 -exec ls -ld {} \;
       - name: Compile on Qualcomm AI Hub

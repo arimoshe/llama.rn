@@ -13,6 +13,14 @@ merged, calib, out = sys.argv[1:4]
 data = torch.load(calib, weights_only=False)
 order = ["latent", "timestep", "text_emb", "image_embeds", "ip_scale"]
 entries = {k: [v.numpy() for v in data[k]] for k in order}
+# QUANT_SAMPLES: calibrate on that many of the samples, drawn at random (as
+# Qualcomm's loader subsamples), to fit the job's time
+limit = int(os.environ.get("QUANT_SAMPLES") or 0)
+if 0 < limit < len(entries["latent"]):
+    import numpy as np
+    idx = np.random.RandomState(42).choice(len(entries["latent"]), limit, replace=False)
+    entries = {k: [v[i] for i in idx] for k, v in entries.items()}
+    data["ip_scale"] = [data["ip_scale"][i] for i in idx]
 n = len(entries["latent"])
 print(f"{n} calibration samples; ip_scale values {sorted({float(s) for s in data['ip_scale']})}")
 del data
