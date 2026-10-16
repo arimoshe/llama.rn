@@ -104,6 +104,18 @@ def attach_ip_adapter(unet: nn.Module, weights: str) -> nn.Module:
     return unet
 
 
+def ip_input_spec(batch_size: int = 1) -> dict:
+    """Qualcomm's SD1.5 UNet inputs (UnetBase.get_input_spec, text_emb_dim
+    768), then the two IP-Adapter ones."""
+    return {
+        "latent": TensorSpec(shape=(batch_size, 4, 64, 64), dtype="float32", apply_runtime_channel_reordering=True),
+        "timestep": TensorSpec(shape=(batch_size, 1), dtype="float32"),
+        "text_emb": TensorSpec(shape=(batch_size, sd.SEQ_LEN, 768), dtype="float32"),
+        "image_embeds": TensorSpec(shape=(batch_size, IMAGE_EMBED_DIM), dtype="float32"),
+        "ip_scale": TensorSpec(shape=(batch_size, 1), dtype="float32"),
+    }
+
+
 class IPUNetWrapper(nn.Module):
     def __init__(self, unet: nn.Module, image_proj: nn.Module, shared: _Shared) -> None:
         super().__init__()
@@ -118,10 +130,7 @@ class IPUNetWrapper(nn.Module):
         return self.model(latent, timestep, tokens, return_dict=False)[0]
 
     def get_input_spec(self, batch_size: int = 1) -> dict:
-        spec = sd.UnetBase.get_input_spec(sd.UnetQuantizable.__new__(sd.UnetQuantizable), batch_size)
-        spec["image_embeds"] = TensorSpec(shape=(batch_size, IMAGE_EMBED_DIM), dtype="float32")
-        spec["ip_scale"] = TensorSpec(shape=(batch_size, 1), dtype="float32")
-        return spec
+        return ip_input_spec(batch_size)
 
     def get_output_spec(self) -> dict:
         return {"output_latent": TensorSpec(apply_runtime_channel_reordering=True)}
@@ -162,7 +171,7 @@ class IPUnetQuantizable(sd.UnetQuantizable):
         return adapt_ip_unet(unet.eval()).to(torch.device(host_device)).eval()
 
     def get_input_spec(self, batch_size: int = 1) -> dict:  # type: ignore[override]
-        return IPUNetWrapper.get_input_spec(self, batch_size)
+        return ip_input_spec(batch_size)
 
     def forward(self, latent, time_emb, text_emb, image_embeds, ip_scale):  # type: ignore[override]
         from qai_hub_models.utils.quantization_aimet_onnx import AIMETOnnxQuantizableMixin
