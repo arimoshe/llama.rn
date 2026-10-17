@@ -152,7 +152,9 @@ export type NativeContextParams = {
   /**
    * With expert_cache_mb: a file the cache rewrites with its counters (JSON:
    * hits, misses, passthrough, readMb, usedMb, budgetMb, prefetched,
-   * prefetchUsed, prefetchLate, prefetchWasted) at the start of each
+   * prefetchUsed, prefetchLate, prefetchWasted, and where generation passes'
+   * time went: genPasses, genGraphMs, genExpertMs, genPrepMs, genReadMs,
+   * genMatMulMs, genAttnMs, genOtherMs, genGapMs) at the start of each
    * pass through the model (fork addition).
    */
   expert_cache_stats_file?: string

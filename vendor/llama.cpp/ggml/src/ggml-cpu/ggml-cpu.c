@@ -1588,6 +1588,38 @@ static uint64_t g_ec_read_bytes, g_ec_passthrough;
 // evicted without being used
 static uint64_t g_ec_prefetched, g_ec_prefetch_used, g_ec_prefetch_late, g_ec_prefetch_wasted;
 
+// Where a generated token's time goes, for the stats file: thread 0's wall
+// clock (ns) per kind of node, each node timed up to the barrier after it, so
+// it includes waiting for the slowest thread. Only graphs that ran an expert
+// op on a generation-sized batch count (g_ec_graph_gen); gap is the time
+// between two such graphs, outside the CPU backend (llama.cpp's own work,
+// sampling, the app). Within the expert ops: prep is the first thread
+// deciding what to read (and the prefetch guess), reads is the op's own
+// reads plus waiting for prefetches still being read.
+enum {
+    GGML_EC_T_GRAPH,
+    GGML_EC_T_EXPERTS,
+    GGML_EC_T_PREP,
+    GGML_EC_T_READS,
+    GGML_EC_T_MATMUL,
+    GGML_EC_T_ATTN,
+    GGML_EC_T_OTHER,
+    GGML_EC_T_GAP,
+    GGML_EC_T_N,
+};
+static uint64_t g_ec_time[GGML_EC_T_N];   // generation graphs so far
+static uint64_t g_ec_graph_time[GGML_EC_T_N]; // the graph running now
+static uint64_t g_ec_gen_graphs;
+static uint64_t g_ec_last_gen_end;        // when the last generation graph ended, 0 if none yet
+static bool     g_ec_graph_gen;
+static bool     g_ec_timing;              // stats file set: time this graph
+
+static uint64_t ggml_ec_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec*1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
 static size_t ggml_ec_page(void) {
     static size_t page = 0;
     if (!page) {
@@ -1976,6 +2008,9 @@ void ggml_cpu_expert_cache_clear(void) {
     g_ec_n_layers = 0;
     g_ec_read_bytes = g_ec_passthrough = 0;
     g_ec_prefetched = g_ec_prefetch_used = g_ec_prefetch_late = g_ec_prefetch_wasted = 0;
+    memset(g_ec_time, 0, sizeof(g_ec_time));
+    g_ec_gen_graphs = 0;
+    g_ec_last_gen_end = 0;
     ggml_critical_section_end();
 }
 
@@ -2198,13 +2233,18 @@ static void ggml_ec_write_stats(int layer, int64_t tokens) {
     fprintf(f, "{\"hits\":%llu,\"misses\":%llu,\"passthrough\":%llu,\"readMb\":%.1f,\"usedMb\":%.1f,\"budgetMb\":%.1f,"
                "\"requestedMb\":%.1f,\"availMb\":%.1f,\"tensors\":%d,\"preadTensors\":%d,"
                "\"layer\":%d,\"layers\":%d,\"tokens\":%lld,"
-               "\"prefetched\":%llu,\"prefetchUsed\":%llu,\"prefetchLate\":%llu,\"prefetchWasted\":%llu}\n",
+               "\"prefetched\":%llu,\"prefetchUsed\":%llu,\"prefetchLate\":%llu,\"prefetchWasted\":%llu,"
+               "\"genPasses\":%llu,\"genGraphMs\":%.1f,\"genExpertMs\":%.1f,\"genPrepMs\":%.1f,\"genReadMs\":%.1f,"
+               "\"genMatMulMs\":%.1f,\"genAttnMs\":%.1f,\"genOtherMs\":%.1f,\"genGapMs\":%.1f}\n",
             (unsigned long long) g_ec.hits, (unsigned long long) g_ec.misses, (unsigned long long) g_ec_passthrough,
             g_ec_read_bytes / 1048576.0, g_ec.used / 1048576.0, g_ec.budget / 1048576.0,
             g_ec.requested / 1048576.0, g_ec.avail / 1048576.0, g_ec.n_tensors, pread_tensors,
             layer, g_ec_n_layers, (long long) tokens,
             (unsigned long long) g_ec_prefetched, (unsigned long long) g_ec_prefetch_used,
-            (unsigned long long) g_ec_prefetch_late, (unsigned long long) g_ec_prefetch_wasted);
+            (unsigned long long) g_ec_prefetch_late, (unsigned long long) g_ec_prefetch_wasted,
+            (unsigned long long) g_ec_gen_graphs, g_ec_time[GGML_EC_T_GRAPH] / 1e6, g_ec_time[GGML_EC_T_EXPERTS] / 1e6,
+            g_ec_time[GGML_EC_T_PREP] / 1e6, g_ec_time[GGML_EC_T_READS] / 1e6, g_ec_time[GGML_EC_T_MATMUL] / 1e6,
+            g_ec_time[GGML_EC_T_ATTN] / 1e6, g_ec_time[GGML_EC_T_OTHER] / 1e6, g_ec_time[GGML_EC_T_GAP] / 1e6);
     fclose(f);
     rename(tmp, path);
 }
@@ -2262,6 +2302,9 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const struct ggml_t
     const uint64_t serial = ++g_ec.serial;
     const int n_as = t->n;
     const bool passthrough = n_tokens > GGML_EC_PASSTHROUGH_TOKENS;
+    if (!passthrough) {
+        g_ec_graph_gen = true;
+    }
 
     // request every missing slice at once, this tensor's and the layer's
     // siblings' (which run next with the same experts), before reading any
@@ -2588,8 +2631,12 @@ static void ggml_compute_forward_mul_mat_id(
 
         expert_ptrs[0] = NULL;
 #ifdef GGML_EXPERT_CACHE
+        const uint64_t t0 = g_ec_timing ? ggml_ec_now() : 0;
         if (!iqp && ggml_ec_prepare(src0, src1, matrix_row_counts, ids->ne[1], expert_ptrs + 1)) {
             expert_ptrs[0] = (const char *) src0->data;
+        }
+        if (g_ec_timing) {
+            g_ec_graph_time[GGML_EC_T_PREP] += ggml_ec_now() - t0;
         }
 #endif
     }
@@ -2606,11 +2653,15 @@ static void ggml_compute_forward_mul_mat_id(
     // the expert slices this op reads from storage, read by all its threads,
     // and those still being read ahead
     if (expert_ptrs[0] && (g_ec_n_reads > 0 || g_ec_n_waits > 0)) {
+        const uint64_t t0 = ith == 0 && g_ec_timing ? ggml_ec_now() : 0;
         ggml_ec_run_reads(ith, nth);
         if (ith == 0 && g_ec_n_waits > 0) {
             ggml_ec_wait_prefetched();
         }
         ggml_barrier(params->threadpool);
+        if (t0) {
+            g_ec_graph_time[GGML_EC_T_READS] += ggml_ec_now() - t0;
+        }
     }
 #endif
 
@@ -4080,6 +4131,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+#ifdef GGML_EXPERT_CACHE
+    // thread 0 times the graph for the expert cache's stats (only thread 0
+    // reads g_ec_timing and the graph's timers)
+    uint64_t t_graph = 0;
+    if (state->ith == 0) {
+        g_ec_timing = getenv("LLAMA_EXPERT_CACHE_STATS_FILE") != NULL && g_ec.n_tensors > 0;
+        if (g_ec_timing) {
+            memset(g_ec_graph_time, 0, sizeof(g_ec_graph_time));
+            g_ec_graph_gen = false;
+            t_graph = ggml_ec_now();
+        }
+    }
+#endif
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -4091,6 +4156,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+#ifdef GGML_EXPERT_CACHE
+        const uint64_t t_node = t_graph ? ggml_ec_now() : 0;
+#endif
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -4110,7 +4179,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+#ifdef GGML_EXPERT_CACHE
+        if (t_node) {
+            const int k = node->op == GGML_OP_MUL_MAT_ID ? GGML_EC_T_EXPERTS
+                        : node->op == GGML_OP_MUL_MAT ? GGML_EC_T_MATMUL
+                        : node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_SOFT_MAX ? GGML_EC_T_ATTN
+                        : GGML_EC_T_OTHER;
+            g_ec_graph_time[k] += ggml_ec_now() - t_node;
+        }
+#endif
     }
+
+#ifdef GGML_EXPERT_CACHE
+    if (t_graph && g_ec_graph_gen) {
+        const uint64_t end = ggml_ec_now();
+        g_ec_graph_time[GGML_EC_T_GRAPH] = end - t_graph;
+        if (g_ec_last_gen_end) {
+            g_ec_graph_time[GGML_EC_T_GAP] = t_graph - g_ec_last_gen_end;
+        }
+        g_ec_last_gen_end = end;
+        for (int i = 0; i < GGML_EC_T_N; i++) {
+            g_ec_time[i] += g_ec_graph_time[i];
+        }
+        g_ec_gen_graphs++;
+    } else if (t_graph) {
+        // a prompt batch: the next generation graph's gap would count it
+        g_ec_last_gen_end = 0;
+    }
+#endif
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
