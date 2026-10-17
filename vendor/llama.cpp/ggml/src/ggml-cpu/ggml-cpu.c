@@ -1614,6 +1614,46 @@ static uint64_t g_ec_last_gen_end;        // when the last generation graph ende
 static bool     g_ec_graph_gen;
 static bool     g_ec_timing;              // stats file set: time this graph
 
+// Slices freed by eviction, kept for the next slice of the same size: a slice
+// is one to a few MB, which the allocator maps and unmaps on every malloc and
+// free, and unmapping stops every core to flush its TLB, while a fresh mapping
+// is faulted in and zeroed page by page as it is read into. Generation evicts
+// one slice for each it reads, so a few spares serve nearly all of them.
+#define GGML_EC_SPARES 16
+static struct { void * p; size_t n; } g_ec_spares[GGML_EC_SPARES];
+static int g_ec_n_spares;
+
+static void * ggml_ec_alloc(size_t n) {
+    for (int i = g_ec_n_spares - 1; i >= 0; i--) {
+        if (g_ec_spares[i].n == n) {
+            void * p = g_ec_spares[i].p;
+            g_ec_spares[i] = g_ec_spares[--g_ec_n_spares];
+            return p;
+        }
+    }
+    return malloc(n);
+}
+
+static void ggml_ec_release(void * p, size_t n) {
+    if (!p) {
+        return;
+    }
+    if (g_ec_n_spares == GGML_EC_SPARES) {
+        // the oldest spare goes: the newest is likelier to be reused
+        free(g_ec_spares[0].p);
+        memmove(&g_ec_spares[0], &g_ec_spares[1], sizeof(g_ec_spares[0]) * (GGML_EC_SPARES - 1));
+        g_ec_n_spares--;
+    }
+    g_ec_spares[g_ec_n_spares].p = p;
+    g_ec_spares[g_ec_n_spares].n = n;
+    g_ec_n_spares++;
+}
+
+// the oldest slices, for eviction (ggml_ec_make_room)
+#define GGML_EC_VICTIMS 64
+static struct { struct ggml_ec_tensor * t; int i; uint64_t used; } g_ec_victims[GGML_EC_VICTIMS];
+static int g_ec_n_victims, g_ec_next_victim;
+
 static uint64_t ggml_ec_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2009,6 +2049,11 @@ void ggml_cpu_expert_cache_clear(void) {
     g_ec_read_bytes = g_ec_passthrough = 0;
     g_ec_prefetched = g_ec_prefetch_used = g_ec_prefetch_late = g_ec_prefetch_wasted = 0;
     memset(g_ec_time, 0, sizeof(g_ec_time));
+    for (int i = 0; i < g_ec_n_spares; i++) {
+        free(g_ec_spares[i].p);
+    }
+    g_ec_n_spares = 0;
+    g_ec_n_victims = g_ec_next_victim = 0;
     g_ec_gen_graphs = 0;
     g_ec_last_gen_end = 0;
     ggml_critical_section_end();
@@ -2055,36 +2100,100 @@ static struct ggml_ec_tensor * ggml_ec_find(const struct ggml_tensor * src0, boo
 }
 
 // frees least recently used slices not needed by the current op, and not
-// being read, until `need` more bytes fit; false when they cannot
+// being read, until `need` more bytes fit; false when they cannot.
+//
+// One pass over the cache lists the oldest few, kept across calls: generation
+// evicts one slice for each it reads, and walking every slot of every expert
+// tensor each time was most of its bookkeeping. A listed slice still holds
+// its place while its tick is unchanged, since ticks only grow: what was not
+// listed was newer at the pass, and is newer still (but for slices being read
+// then, which were skipped; near enough, as their ticks are recent).
+
+static bool ggml_ec_evictable(const struct ggml_ec_entry * e) {
+    return e->data && e->pin != g_ec.serial && atomic_load_explicit(&e->state, memory_order_relaxed) == GGML_EC_READY;
+}
+
+static void ggml_ec_find_victims(void) {
+    int nv = 0;
+    for (int i = 0; i < g_ec.n_tensors; i++) {
+        struct ggml_ec_tensor * t = &g_ec.t[i];
+        for (int j = 0; j < t->n; j++) {
+            const struct ggml_ec_entry * e = &t->e[j];
+            if (!ggml_ec_evictable(e) || (nv == GGML_EC_VICTIMS && e->used >= g_ec_victims[nv - 1].used)) {
+                continue;
+            }
+            // insert, oldest first
+            int k = nv < GGML_EC_VICTIMS ? nv++ : nv - 1;
+            while (k > 0 && g_ec_victims[k - 1].used > e->used) {
+                g_ec_victims[k] = g_ec_victims[k - 1];
+                k--;
+            }
+            g_ec_victims[k].t = t;
+            g_ec_victims[k].i = j;
+            g_ec_victims[k].used = e->used;
+        }
+    }
+    g_ec_n_victims = nv;
+    g_ec_next_victim = 0;
+}
+
 static bool ggml_ec_make_room(size_t need) {
+    bool rescanned = false;
     while (g_ec.used + need > g_ec.budget) {
-        struct ggml_ec_tensor * best_t = NULL;
-        int best_i = -1;
-        uint64_t best = UINT64_MAX;
-        for (int i = 0; i < g_ec.n_tensors; i++) {
-            struct ggml_ec_tensor * t = &g_ec.t[i];
-            for (int j = 0; j < t->n; j++) {
-                struct ggml_ec_entry * e = &t->e[j];
-                if (e->data && e->pin != g_ec.serial && e->used < best &&
-                    atomic_load_explicit(&e->state, memory_order_relaxed) == GGML_EC_READY) {
-                    best = e->used;
-                    best_t = t;
-                    best_i = j;
-                }
+        if (g_ec_next_victim == g_ec_n_victims) {
+            if (rescanned) {
+                return false;
+            }
+            ggml_ec_find_victims();
+            rescanned = g_ec_n_victims < GGML_EC_VICTIMS; // a short list: nothing else to find
+            if (g_ec_n_victims == 0) {
+                return false;
             }
         }
-        if (!best_t) {
-            return false;
+        struct ggml_ec_tensor * t = g_ec_victims[g_ec_next_victim].t;
+        struct ggml_ec_entry * e = &t->e[g_ec_victims[g_ec_next_victim].i];
+        const uint64_t used = g_ec_victims[g_ec_next_victim].used;
+        g_ec_next_victim++;
+        if (!ggml_ec_evictable(e) || e->used != used) {
+            // used since, freed, or needed now: still there, but no longer the oldest
+            continue;
         }
-        struct ggml_ec_entry * e = &best_t->e[best_i];
         if (e->prefetched) {
             g_ec_prefetch_wasted++;
             e->prefetched = false;
         }
-        free(e->data);
+        ggml_ec_release(e->data, t->slice);
         e->data = NULL;
-        g_ec.used -= best_t->slice;
+        g_ec.used -= t->slice;
     }
+    return true;
+}
+
+// Makes a slot for expert a of s and queues it for a reader thread; false
+// when there is no room or no reader. A slice already there is kept for now.
+static bool ggml_ec_read_ahead(struct ggml_ec_tensor * s, int a) {
+    struct ggml_ec_entry * e = &s->e[a];
+    if (e->data) {
+        e->used = ++g_ec.tick;
+        return true;
+    }
+    if (!ggml_ec_make_room(s->slice) || (e->data = ggml_ec_alloc(s->slice)) == NULL) {
+        return false;
+    }
+    e->used = ++g_ec.tick;
+    e->prefetched = true;
+    g_ec.used += s->slice;
+    atomic_store_explicit(&e->state, GGML_EC_QUEUED, memory_order_release);
+    if (!ggml_ec_push_job(s, a)) {
+        atomic_store_explicit(&e->state, GGML_EC_READY, memory_order_relaxed);
+        e->prefetched = false;
+        ggml_ec_release(e->data, s->slice);
+        e->data = NULL;
+        g_ec.used -= s->slice;
+        return false;
+    }
+    g_ec_prefetched++;
+    g_ec_read_bytes += s->slice;
     return true;
 }
 
@@ -2169,33 +2278,9 @@ static void ggml_ec_prefetch_next(const struct ggml_ec_tensor * t, const struct 
             continue;
         }
         for (int a = 0; a < n_expert; a++) {
-            if (!want[a]) {
-                continue;
-            }
-            struct ggml_ec_entry * e = &s->e[a];
-            if (e->data) {
-                e->used = ++g_ec.tick; // keep it for the next layer
-                continue;
-            }
-            if (!ggml_ec_make_room(s->slice) || (e->data = malloc(s->slice)) == NULL) {
+            if (want[a] && !ggml_ec_read_ahead(s, a)) {
                 return;
             }
-            e->used = ++g_ec.tick;
-            e->prefetched = true;
-            g_ec.used += s->slice;
-            atomic_store_explicit(&e->state, GGML_EC_QUEUED, memory_order_release);
-            if (!ggml_ec_push_job(s, a)) {
-                // no reader: give the slot back
-                atomic_store_explicit(&e->state, GGML_EC_READY, memory_order_relaxed);
-                e->prefetched = false;
-                free(e->data);
-                e->data = NULL;
-                g_ec.used -= s->slice;
-                return;
-            }
-            ggml_ec_prefetch(s, a*s->slice, s->slice);
-            g_ec_prefetched++;
-            g_ec_read_bytes += s->slice;
         }
     }
 }
@@ -2203,7 +2288,7 @@ static void ggml_ec_prefetch_next(const struct ggml_ec_tensor * t, const struct 
 static void ggml_ec_release_pending(void) {
     for (int i = 0; i < g_ec_n_pending; i++) {
         if (g_ec_pending[i].buf) {
-            free(g_ec_pending[i].buf);
+            ggml_ec_release(g_ec_pending[i].buf, g_ec_pending[i].n);
         } else {
             ggml_ec_advise(g_ec_pending[i].p, g_ec_pending[i].n, MADV_DONTNEED);
         }
@@ -2306,14 +2391,20 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const struct ggml_t
         g_ec_graph_gen = true;
     }
 
-    // request every missing slice at once, this tensor's and the layer's
-    // siblings' (which run next with the same experts), before reading any
+    // Request every missing slice at once, this tensor's and the layer's
+    // siblings' (which run next with the same experts), before reading any.
+    // This tensor's are about to be read with pread, which needs no notice;
+    // read from the mapping, they are faulted in a page at a time without it.
+    // With reader threads, a generation's siblings are queued for them: read
+    // while this op runs, where WILLNEED would make this thread submit the
+    // reads itself while the op's other threads wait.
+    const bool readers = !passthrough && ggml_ec_prefetch_threads() > 0;
     for (int a = 0; a < n_as; a++) {
         if (counts[a] == 0) {
             continue;
         }
         t->e[a].pin = serial;
-        if (!t->e[a].data) {
+        if (!t->e[a].data && t->fd < 0) {
             ggml_ec_prefetch(t, a*t->slice, t->slice);
         }
     }
@@ -2324,7 +2415,7 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const struct ggml_t
         }
         if (s->layer == t->layer) {
             for (int a = 0; a < n_as; a++) {
-                if (counts[a] > 0 && !s->e[a].data) {
+                if (counts[a] > 0 && !s->e[a].data && (!readers || !ggml_ec_read_ahead(s, a))) {
                     ggml_ec_prefetch(s, a*s->slice, s->slice);
                 } else if (counts[a] > 0) {
                     s->e[a].used = ++g_ec.tick; // runs next: not for a prefetch to evict
@@ -2370,7 +2461,7 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const struct ggml_t
             g_ec_passthrough++;
             g_ec_read_bytes += t->slice;
             if (g_ec_n_pending < GGML_EC_MAX_PENDING) {
-                void * buf = t->fd >= 0 ? malloc(t->slice) : NULL;
+                void * buf = t->fd >= 0 ? ggml_ec_alloc(t->slice) : NULL;
                 if (buf) {
                     ggml_ec_queue(t, a, buf, NULL);
                 }
@@ -2389,7 +2480,7 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const struct ggml_t
             // only fills free room, which warms an empty cache
             g_ec.misses++;
             g_ec_read_bytes += t->slice;
-            if ((passthrough || ggml_ec_make_room(t->slice)) && (e->data = malloc(t->slice)) != NULL) {
+            if ((passthrough || ggml_ec_make_room(t->slice)) && (e->data = ggml_ec_alloc(t->slice)) != NULL) {
                 // the copy is what is read from now on
                 ggml_ec_queue(t, a, e->data, NULL);
                 g_ec.used += t->slice;
@@ -2399,7 +2490,7 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const struct ggml_t
         ptrs[a] = e->data ? (const char *) e->data : mapped;
     }
     // generation: read the next layer's likely experts while this one runs
-    if (first_of_layer && !passthrough && src1 && ggml_ec_prefetch_threads() > 0) {
+    if (first_of_layer && readers && src1) {
         ggml_ec_prefetch_next(t, src1);
     }
     ggml_critical_section_end();
