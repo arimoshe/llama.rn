@@ -676,6 +676,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_expert_cache_stats") == 0) {
         return (void *)ggml_cpu_expert_cache_stats;
     }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_set_router") == 0) {
+        return (void *)ggml_cpu_expert_cache_set_router;
+    }
+    if (strcmp(name, "ggml_backend_cpu_expert_cache_forget_routers") == 0) {
+        return (void *)ggml_cpu_expert_cache_forget_routers;
+    }
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
     }

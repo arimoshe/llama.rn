@@ -1496,6 +1496,16 @@ UseGgmlGemm2:;
 // (the model, context and compute buffers allocated by then) at the memory
 // still available less a reserve: a budget past that pushes the process
 // into swap and the low-memory killer.
+//
+// Prefetch (LLAMA_EXPERT_PREFETCH=<reader threads>): in generation, when a
+// layer's experts are about to run, the next layer's are guessed from this
+// layer's router input (rescaled by the two layers' ffn norms, then run
+// through the next layer's router, which llama-model.cpp hands over) and the
+// missing ones are queued for background reader threads. On LFM2.5-24B-A2B
+// the guess holds about 85% of the experts the next layer picks, so most
+// misses are in flight, many at once, before the layer asks. An entry being
+// read is never evicted; an op that needs one still queued reads it itself,
+// and waits for one a reader has started.
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -1507,9 +1517,17 @@ UseGgmlGemm2:;
 #ifdef GGML_EXPERT_CACHE
 
 struct ggml_ec_entry {
-    void *   data;
-    uint64_t used; // tick of the last use
-    uint64_t pin;  // op serial that needs it now
+    void *     data;
+    uint64_t   used;       // tick of the last use
+    uint64_t   pin;        // op serial that needs it now
+    atomic_int state;      // GGML_EC_READY, or a prefetch queued or being read into data
+    bool       prefetched; // read ahead and not used yet
+};
+
+enum {
+    GGML_EC_READY   = 0,
+    GGML_EC_QUEUED  = 1,
+    GGML_EC_READING = 2,
 };
 
 struct ggml_ec_tensor {
@@ -1549,8 +1567,13 @@ static int g_ec_n_pending;
 // Reads the current op needs, filled by ggml_ec_prepare and done by every
 // thread of the op (ggml_ec_run_reads) before any of them computes.
 #define GGML_EC_MAX_READS 1024
-static struct { const struct ggml_ec_tensor * t; int a; void * dst; } g_ec_reads[GGML_EC_MAX_READS];
+// `e` is set for a queued prefetch taken over by the op, marked ready once read.
+static struct { const struct ggml_ec_tensor * t; int a; void * dst; struct ggml_ec_entry * e; } g_ec_reads[GGML_EC_MAX_READS];
 static int g_ec_n_reads;
+
+// prefetches the current op needs that a reader thread is still reading
+static struct ggml_ec_entry * g_ec_waits[GGML_EC_MAX_READS];
+static int g_ec_n_waits;
 
 // files behind the expert mappings, opened once each
 #define GGML_EC_MAX_FILES 16
@@ -1561,6 +1584,9 @@ static int g_ec_n_files;
 static int g_ec_last_layer = -1;
 static int g_ec_n_layers;   // highest layer seen + 1
 static uint64_t g_ec_read_bytes, g_ec_passthrough;
+// slices read ahead; of those, used later, used while still being read, and
+// evicted without being used
+static uint64_t g_ec_prefetched, g_ec_prefetch_used, g_ec_prefetch_late, g_ec_prefetch_wasted;
 
 static size_t ggml_ec_page(void) {
     static size_t page = 0;
@@ -1735,14 +1761,18 @@ static void ggml_ec_load(const struct ggml_ec_tensor * t, int a, void * dst) {
 
 // queues the read of expert a's slice into dst for the op's threads; read
 // at once when the queue is full
-static void ggml_ec_queue(const struct ggml_ec_tensor * t, int a, void * dst) {
+static void ggml_ec_queue(const struct ggml_ec_tensor * t, int a, void * dst, struct ggml_ec_entry * e) {
     if (g_ec_n_reads < GGML_EC_MAX_READS) {
         g_ec_reads[g_ec_n_reads].t   = t;
         g_ec_reads[g_ec_n_reads].a   = a;
         g_ec_reads[g_ec_n_reads].dst = dst;
+        g_ec_reads[g_ec_n_reads].e   = e;
         g_ec_n_reads++;
     } else {
         ggml_ec_load(t, a, dst);
+        if (e) {
+            atomic_store_explicit(&e->state, GGML_EC_READY, memory_order_release);
+        }
     }
 }
 
@@ -1752,7 +1782,165 @@ static void ggml_ec_queue(const struct ggml_ec_tensor * t, int a, void * dst) {
 static void ggml_ec_run_reads(int ith, int nth) {
     for (int i = ith; i < g_ec_n_reads; i += nth) {
         ggml_ec_load(g_ec_reads[i].t, g_ec_reads[i].a, g_ec_reads[i].dst);
+        if (g_ec_reads[i].e) {
+            atomic_store_explicit(&g_ec_reads[i].e->state, GGML_EC_READY, memory_order_release);
+        }
     }
+}
+
+// prefetch reader threads, started on first use
+
+#define GGML_EC_MAX_JOBS    4096
+#define GGML_EC_MAX_READERS 16
+
+static struct { const struct ggml_ec_tensor * t; int a; } g_ec_jobs[GGML_EC_MAX_JOBS];
+static int g_ec_job_head, g_ec_job_count; // ring
+static int g_ec_job_running;              // taken by a reader, not finished
+static pthread_mutex_t g_ec_job_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_ec_job_cond  = PTHREAD_COND_INITIALIZER; // a job was queued
+static pthread_cond_t  g_ec_done_cond = PTHREAD_COND_INITIALIZER; // a job finished
+static int g_ec_n_readers;
+
+static void * ggml_ec_reader(void * arg) {
+    GGML_UNUSED(arg);
+    pthread_mutex_lock(&g_ec_job_mutex);
+    for (;;) {
+        while (g_ec_job_count == 0) {
+            pthread_cond_wait(&g_ec_job_cond, &g_ec_job_mutex);
+        }
+        const struct ggml_ec_tensor * t = g_ec_jobs[g_ec_job_head].t;
+        const int a = g_ec_jobs[g_ec_job_head].a;
+        g_ec_job_head = (g_ec_job_head + 1) % GGML_EC_MAX_JOBS;
+        g_ec_job_count--;
+        g_ec_job_running++;
+        pthread_mutex_unlock(&g_ec_job_mutex);
+
+        // an op may have taken it over since it was queued
+        struct ggml_ec_entry * e = &t->e[a];
+        int queued = GGML_EC_QUEUED;
+        if (atomic_compare_exchange_strong_explicit(&e->state, &queued, GGML_EC_READING,
+                                                    memory_order_acquire, memory_order_relaxed)) {
+            ggml_ec_load(t, a, e->data);
+            atomic_store_explicit(&e->state, GGML_EC_READY, memory_order_release);
+        }
+
+        pthread_mutex_lock(&g_ec_job_mutex);
+        g_ec_job_running--;
+        pthread_cond_broadcast(&g_ec_done_cond);
+    }
+    return NULL;
+}
+
+// reader threads asked for, 0 when prefetch is off
+static int ggml_ec_prefetch_threads(void) {
+    const char * env = getenv("LLAMA_EXPERT_PREFETCH");
+    const int n = env ? atoi(env) : 0;
+    return n < 0 ? 0 : n > GGML_EC_MAX_READERS ? GGML_EC_MAX_READERS : n;
+}
+
+// queues expert a's slice for a reader; false when that cannot be done
+static bool ggml_ec_push_job(const struct ggml_ec_tensor * t, int a) {
+    pthread_mutex_lock(&g_ec_job_mutex);
+    const int want = ggml_ec_prefetch_threads();
+    while (g_ec_n_readers < want) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, ggml_ec_reader, NULL) != 0) {
+            break;
+        }
+        pthread_detach(th);
+        g_ec_n_readers++;
+    }
+    const bool ok = g_ec_n_readers > 0 && g_ec_job_count < GGML_EC_MAX_JOBS;
+    if (ok) {
+        const int i = (g_ec_job_head + g_ec_job_count) % GGML_EC_MAX_JOBS;
+        g_ec_jobs[i].t = t;
+        g_ec_jobs[i].a = a;
+        g_ec_job_count++;
+        pthread_cond_signal(&g_ec_job_cond);
+    }
+    pthread_mutex_unlock(&g_ec_job_mutex);
+    return ok;
+}
+
+// Waits until every slice in g_ec_waits is read. Called by one thread of the
+// op, between the barriers around the op's own reads.
+static void ggml_ec_wait_prefetched(void) {
+    pthread_mutex_lock(&g_ec_job_mutex);
+    for (int i = 0; i < g_ec_n_waits; i++) {
+        while (atomic_load_explicit(&g_ec_waits[i]->state, memory_order_acquire) != GGML_EC_READY) {
+            pthread_cond_wait(&g_ec_done_cond, &g_ec_job_mutex);
+        }
+    }
+    pthread_mutex_unlock(&g_ec_job_mutex);
+}
+
+// Drops the queued jobs and waits for the running ones, so that no reader
+// holds a slice about to be freed.
+static void ggml_ec_stop_jobs(void) {
+    pthread_mutex_lock(&g_ec_job_mutex);
+    g_ec_job_count = 0;
+    while (g_ec_job_running > 0) {
+        pthread_cond_wait(&g_ec_done_cond, &g_ec_job_mutex);
+    }
+    pthread_mutex_unlock(&g_ec_job_mutex);
+}
+
+// routers, for guessing the next layer's experts
+
+#define GGML_EC_MAX_LAYERS 512
+
+static struct ggml_ec_router {
+    const void *  owner;  // the model
+    const float * w;      // [n_expert][n_embd]
+    const float * norm;   // [n_embd] ffn norm weights, or NULL
+    const float * bias;   // [n_expert] selection bias, or NULL
+    int           n_embd;
+    int           n_expert;
+    int           gating; // llama_expert_gating_func_type
+    int           n_used;
+} g_ec_routers[GGML_EC_MAX_LAYERS];
+
+static const float * ggml_ec_host_f32(const struct ggml_tensor * t, int64_t n) {
+    if (!t || t->type != GGML_TYPE_F32 || !t->data || ggml_nelements(t) != n || !ggml_is_contiguous(t) ||
+        (t->buffer && !ggml_backend_buffer_is_host(t->buffer))) {
+        return NULL;
+    }
+    return (const float *) t->data;
+}
+
+void ggml_cpu_expert_cache_set_router(const void * owner, int layer, const struct ggml_tensor * gate_inp,
+                                      const struct ggml_tensor * norm, const struct ggml_tensor * bias,
+                                      int gating, int n_used) {
+    if (layer < 0 || layer >= GGML_EC_MAX_LAYERS || !gate_inp || gate_inp->ne[2] != 1 || gate_inp->ne[3] != 1) {
+        return;
+    }
+    const int n_embd   = (int) gate_inp->ne[0];
+    const int n_expert = (int) gate_inp->ne[1];
+    const float * w = ggml_ec_host_f32(gate_inp, (int64_t) n_embd * n_expert);
+    if (!w || n_used <= 0 || n_used > n_expert) {
+        return;
+    }
+    ggml_critical_section_start();
+    struct ggml_ec_router * r = &g_ec_routers[layer];
+    r->owner    = owner;
+    r->w        = w;
+    r->norm     = ggml_ec_host_f32(norm, n_embd);
+    r->bias     = ggml_ec_host_f32(bias, n_expert);
+    r->n_embd   = n_embd;
+    r->n_expert = n_expert;
+    r->gating   = gating;
+    r->n_used   = n_used;
+    ggml_critical_section_end();
+}
+
+void ggml_cpu_expert_cache_forget_routers(const void * owner) {
+    ggml_critical_section_start();
+    for (int i = 0; i < GGML_EC_MAX_LAYERS; i++) {
+        if (g_ec_routers[i].owner == owner) {
+            memset(&g_ec_routers[i], 0, sizeof(g_ec_routers[i]));
+        }
+    }
+    ggml_critical_section_end();
 }
 
 static void ggml_ec_free_tensor(struct ggml_ec_tensor * t) {
@@ -1767,6 +1955,7 @@ static void ggml_ec_free_tensor(struct ggml_ec_tensor * t) {
 }
 
 void ggml_cpu_expert_cache_clear(void) {
+    ggml_ec_stop_jobs();
     ggml_critical_section_start();
     for (int i = 0; i < g_ec.n_tensors; i++) {
         ggml_ec_free_tensor(&g_ec.t[i]);
@@ -1786,6 +1975,7 @@ void ggml_cpu_expert_cache_clear(void) {
     g_ec_last_layer = -1;
     g_ec_n_layers = 0;
     g_ec_read_bytes = g_ec_passthrough = 0;
+    g_ec_prefetched = g_ec_prefetch_used = g_ec_prefetch_late = g_ec_prefetch_wasted = 0;
     ggml_critical_section_end();
 }
 
@@ -1829,8 +2019,8 @@ static struct ggml_ec_tensor * ggml_ec_find(const struct ggml_tensor * src0, boo
     return t;
 }
 
-// frees least recently used slices not needed by the current op until
-// `need` more bytes fit; false when they cannot
+// frees least recently used slices not needed by the current op, and not
+// being read, until `need` more bytes fit; false when they cannot
 static bool ggml_ec_make_room(size_t need) {
     while (g_ec.used + need > g_ec.budget) {
         struct ggml_ec_tensor * best_t = NULL;
@@ -1840,7 +2030,8 @@ static bool ggml_ec_make_room(size_t need) {
             struct ggml_ec_tensor * t = &g_ec.t[i];
             for (int j = 0; j < t->n; j++) {
                 struct ggml_ec_entry * e = &t->e[j];
-                if (e->data && e->pin != g_ec.serial && e->used < best) {
+                if (e->data && e->pin != g_ec.serial && e->used < best &&
+                    atomic_load_explicit(&e->state, memory_order_relaxed) == GGML_EC_READY) {
                     best = e->used;
                     best_t = t;
                     best_i = j;
@@ -1850,11 +2041,128 @@ static bool ggml_ec_make_room(size_t need) {
         if (!best_t) {
             return false;
         }
-        free(best_t->e[best_i].data);
-        best_t->e[best_i].data = NULL;
+        struct ggml_ec_entry * e = &best_t->e[best_i];
+        if (e->prefetched) {
+            g_ec_prefetch_wasted++;
+            e->prefetched = false;
+        }
+        free(e->data);
+        e->data = NULL;
         g_ec.used -= best_t->slice;
     }
     return true;
+}
+
+// Guesses layer `t->layer + 1`'s experts for the tokens in src1 (this layer's
+// router input, [n_embd, 1, n_tokens]) and queues the missing slices of that
+// layer's expert tensors for the reader threads.
+static void ggml_ec_prefetch_next(const struct ggml_ec_tensor * t, const struct ggml_tensor * src1) {
+    const int next = t->layer + 1;
+    if (t->layer < 0 || next >= GGML_EC_MAX_LAYERS) {
+        return;
+    }
+    const struct ggml_ec_router * rc = &g_ec_routers[t->layer];
+    const struct ggml_ec_router * rn = &g_ec_routers[next];
+    const int n_embd = rn->n_embd, n_expert = rn->n_expert;
+    if (!rn->w || n_expert != t->n || src1->type != GGML_TYPE_F32 || src1->ne[0] != n_embd || src1->ne[1] != 1 ||
+        src1->ne[3] != 1 || src1->nb[0] != sizeof(float)) {
+        return;
+    }
+    // the input is this layer's ffn norm output: undo its weights, apply the next layer's
+    const bool rescale = rc->w && rc->n_embd == n_embd && rc->norm && rn->norm;
+
+    const char * env_k = getenv("LLAMA_EXPERT_PREFETCH_TOPK");
+    int k = env_k ? atoi(env_k) : rn->n_used;
+    k = k < 1 ? 1 : k > n_expert ? n_expert : k;
+
+    float x[8192];
+    float score[512];
+    bool want[512] = { false };
+    if (n_embd > 8192 || n_expert > 512) {
+        return;
+    }
+    for (int64_t tok = 0; tok < src1->ne[2]; tok++) {
+        const float * in = (const float *) ((const char *) src1->data + tok*src1->nb[2]);
+        for (int i = 0; i < n_embd; i++) {
+            x[i] = rescale ? (rc->norm[i] != 0.0f ? in[i] / rc->norm[i] * rn->norm[i] : 0.0f) : in[i];
+        }
+        float max = -INFINITY;
+        for (int e = 0; e < n_expert; e++) {
+            const float * w = rn->w + (size_t) e*n_embd;
+            float acc = 0.0f;
+            for (int i = 0; i < n_embd; i++) {
+                acc += w[i]*x[i];
+            }
+            score[e] = acc;
+            max = MAX(max, acc);
+        }
+        // as build_moe_ffn: probabilities, then the selection bias
+        if (rn->gating == 1) { // softmax
+            float sum = 0.0f;
+            for (int e = 0; e < n_expert; e++) {
+                score[e] = expf(score[e] - max);
+                sum += score[e];
+            }
+            for (int e = 0; e < n_expert; e++) {
+                score[e] /= sum;
+            }
+        } else if (rn->gating == 2) { // sigmoid
+            for (int e = 0; e < n_expert; e++) {
+                score[e] = 1.0f/(1.0f + expf(-score[e]));
+            }
+        }
+        if (rn->bias) {
+            for (int e = 0; e < n_expert; e++) {
+                score[e] += rn->bias[e];
+            }
+        }
+        for (int j = 0; j < k; j++) {
+            int best = -1;
+            for (int e = 0; e < n_expert; e++) {
+                if (score[e] != -INFINITY && (best < 0 || score[e] > score[best])) {
+                    best = e;
+                }
+            }
+            want[best] = true;
+            score[best] = -INFINITY;
+        }
+    }
+
+    for (int i = 0; i < g_ec.n_tensors; i++) {
+        struct ggml_ec_tensor * s = &g_ec.t[i];
+        if (s->layer != next || s->buffer != t->buffer || s->n != n_expert) {
+            continue;
+        }
+        for (int a = 0; a < n_expert; a++) {
+            if (!want[a]) {
+                continue;
+            }
+            struct ggml_ec_entry * e = &s->e[a];
+            if (e->data) {
+                e->used = ++g_ec.tick; // keep it for the next layer
+                continue;
+            }
+            if (!ggml_ec_make_room(s->slice) || (e->data = malloc(s->slice)) == NULL) {
+                return;
+            }
+            e->used = ++g_ec.tick;
+            e->prefetched = true;
+            g_ec.used += s->slice;
+            atomic_store_explicit(&e->state, GGML_EC_QUEUED, memory_order_release);
+            if (!ggml_ec_push_job(s, a)) {
+                // no reader: give the slot back
+                atomic_store_explicit(&e->state, GGML_EC_READY, memory_order_relaxed);
+                e->prefetched = false;
+                free(e->data);
+                e->data = NULL;
+                g_ec.used -= s->slice;
+                return;
+            }
+            ggml_ec_prefetch(s, a*s->slice, s->slice);
+            g_ec_prefetched++;
+            g_ec_read_bytes += s->slice;
+        }
+    }
 }
 
 static void ggml_ec_release_pending(void) {
@@ -1889,11 +2197,14 @@ static void ggml_ec_write_stats(int layer, int64_t tokens) {
     }
     fprintf(f, "{\"hits\":%llu,\"misses\":%llu,\"passthrough\":%llu,\"readMb\":%.1f,\"usedMb\":%.1f,\"budgetMb\":%.1f,"
                "\"requestedMb\":%.1f,\"availMb\":%.1f,\"tensors\":%d,\"preadTensors\":%d,"
-               "\"layer\":%d,\"layers\":%d,\"tokens\":%lld}\n",
+               "\"layer\":%d,\"layers\":%d,\"tokens\":%lld,"
+               "\"prefetched\":%llu,\"prefetchUsed\":%llu,\"prefetchLate\":%llu,\"prefetchWasted\":%llu}\n",
             (unsigned long long) g_ec.hits, (unsigned long long) g_ec.misses, (unsigned long long) g_ec_passthrough,
             g_ec_read_bytes / 1048576.0, g_ec.used / 1048576.0, g_ec.budget / 1048576.0,
             g_ec.requested / 1048576.0, g_ec.avail / 1048576.0, g_ec.n_tensors, pread_tensors,
-            layer, g_ec_n_layers, (long long) tokens);
+            layer, g_ec_n_layers, (long long) tokens,
+            (unsigned long long) g_ec_prefetched, (unsigned long long) g_ec_prefetch_used,
+            (unsigned long long) g_ec_prefetch_late, (unsigned long long) g_ec_prefetch_wasted);
     fclose(f);
     rename(tmp, path);
 }
@@ -1905,8 +2216,10 @@ static void ggml_ec_write_stats(int layer, int64_t tokens) {
 
 // Fills ptrs[a] for every expert a with counts[a] > 0: the cached copy, or
 // the mapped weights when passing through or the cache is full. Returns
-// false when the cache is not used for this tensor (ptrs untouched).
-static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * counts, int64_t n_tokens, const char ** ptrs) {
+// false when the cache is not used for this tensor (ptrs untouched). src1 is
+// the op's input, the layer's router input for its first expert op.
+static bool ggml_ec_prepare(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const int64_t * counts,
+                            int64_t n_tokens, const char ** ptrs) {
     const size_t budget = ggml_ec_budget();
     if (budget == 0) {
         if (g_ec.n_tensors > 0) {
@@ -1929,11 +2242,13 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
     }
     ggml_ec_release_pending();
     g_ec_n_reads = 0;
+    g_ec_n_waits = 0;
     struct ggml_ec_tensor * t = ggml_ec_find(src0, true);
     if (!t) {
         ggml_critical_section_end();
         return false;
     }
+    const bool first_of_layer = t->layer >= 0 && t->layer != g_ec_last_layer;
     if (t->layer >= 0) {
         if (t->layer + 1 > g_ec_n_layers) {
             g_ec_n_layers = t->layer + 1;
@@ -1968,6 +2283,8 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
             for (int a = 0; a < n_as; a++) {
                 if (counts[a] > 0 && !s->e[a].data) {
                     ggml_ec_prefetch(s, a*s->slice, s->slice);
+                } else if (counts[a] > 0) {
+                    s->e[a].used = ++g_ec.tick; // runs next: not for a prefetch to evict
                 }
             }
         } else if (passthrough && s->layer == t->layer + 1) {
@@ -1985,6 +2302,25 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
         const char * mapped = (const char *) t->base + a*t->slice;
         if (e->data) {
             g_ec.hits++;
+            if (e->prefetched) {
+                g_ec_prefetch_used++;
+                e->prefetched = false;
+            }
+            int queued = GGML_EC_QUEUED;
+            if (atomic_compare_exchange_strong_explicit(&e->state, &queued, GGML_EC_READING,
+                                                        memory_order_acquire, memory_order_relaxed)) {
+                // no reader has started it: read it with the op's threads
+                g_ec_prefetch_late++;
+                ggml_ec_queue(t, a, e->data, e);
+            } else if (queued == GGML_EC_READING && g_ec_n_waits < GGML_EC_MAX_READS) {
+                g_ec_prefetch_late++;
+                g_ec_waits[g_ec_n_waits++] = e;
+            } else if (queued == GGML_EC_READING) {
+                // no room to note it: wait now
+                while (atomic_load_explicit(&e->state, memory_order_acquire) != GGML_EC_READY) {
+                    sched_yield();
+                }
+            }
         } else if (passthrough && g_ec.used + t->slice > g_ec.budget) {
             // no room without evicting: read this once, into a buffer
             // freed at the next op (or straight from the mapping)
@@ -1993,7 +2329,7 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
             if (g_ec_n_pending < GGML_EC_MAX_PENDING) {
                 void * buf = t->fd >= 0 ? malloc(t->slice) : NULL;
                 if (buf) {
-                    ggml_ec_queue(t, a, buf);
+                    ggml_ec_queue(t, a, buf, NULL);
                 }
                 g_ec_pending[g_ec_n_pending].p = mapped;
                 g_ec_pending[g_ec_n_pending].n = t->slice;
@@ -2012,12 +2348,16 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
             g_ec_read_bytes += t->slice;
             if ((passthrough || ggml_ec_make_room(t->slice)) && (e->data = malloc(t->slice)) != NULL) {
                 // the copy is what is read from now on
-                ggml_ec_queue(t, a, e->data);
+                ggml_ec_queue(t, a, e->data, NULL);
                 g_ec.used += t->slice;
             }
         }
         e->used = ++g_ec.tick;
         ptrs[a] = e->data ? (const char *) e->data : mapped;
+    }
+    // generation: read the next layer's likely experts while this one runs
+    if (first_of_layer && !passthrough && src1 && ggml_ec_prefetch_threads() > 0) {
+        ggml_ec_prefetch_next(t, src1);
     }
     ggml_critical_section_end();
     return true;
@@ -2026,6 +2366,17 @@ static bool ggml_ec_prepare(const struct ggml_tensor * src0, const int64_t * cou
 #else
 
 void ggml_cpu_expert_cache_clear(void) {}
+
+void ggml_cpu_expert_cache_set_router(const void * owner, int layer, const struct ggml_tensor * gate_inp,
+                                      const struct ggml_tensor * norm, const struct ggml_tensor * bias,
+                                      int gating, int n_used) {
+    GGML_UNUSED(owner); GGML_UNUSED(layer); GGML_UNUSED(gate_inp); GGML_UNUSED(norm); GGML_UNUSED(bias);
+    GGML_UNUSED(gating); GGML_UNUSED(n_used);
+}
+
+void ggml_cpu_expert_cache_forget_routers(const void * owner) {
+    GGML_UNUSED(owner);
+}
 
 void ggml_cpu_expert_cache_stats(uint64_t * hits, uint64_t * misses, size_t * used, size_t * budget) {
     if (hits)   *hits   = 0;
@@ -2237,7 +2588,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         expert_ptrs[0] = NULL;
 #ifdef GGML_EXPERT_CACHE
-        if (!iqp && ggml_ec_prepare(src0, matrix_row_counts, ids->ne[1], expert_ptrs + 1)) {
+        if (!iqp && ggml_ec_prepare(src0, src1, matrix_row_counts, ids->ne[1], expert_ptrs + 1)) {
             expert_ptrs[0] = (const char *) src0->data;
         }
 #endif
@@ -2252,9 +2603,13 @@ static void ggml_compute_forward_mul_mat_id(
     ggml_barrier(params->threadpool);
 
 #ifdef GGML_EXPERT_CACHE
-    // the expert slices this op reads from storage, read by all its threads
-    if (expert_ptrs[0] && g_ec_n_reads > 0) {
+    // the expert slices this op reads from storage, read by all its threads,
+    // and those still being read ahead
+    if (expert_ptrs[0] && (g_ec_n_reads > 0 || g_ec_n_waits > 0)) {
         ggml_ec_run_reads(ith, nth);
+        if (ith == 0 && g_ec_n_waits > 0) {
+            ggml_ec_wait_prefetched();
+        }
         ggml_barrier(params->threadpool);
     }
 #endif

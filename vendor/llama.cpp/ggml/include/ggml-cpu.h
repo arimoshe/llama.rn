@@ -152,6 +152,14 @@ extern "C" {
     // cached slice; a model's are stale once it is freed.
     GGML_BACKEND_API void ggml_cpu_expert_cache_clear(void);
     GGML_BACKEND_API void ggml_cpu_expert_cache_stats(uint64_t * hits, uint64_t * misses, size_t * used, size_t * budget);
+    // A layer's router (ffn_gate_inp), ffn norm weights and selection bias,
+    // for guessing its experts from the layer before and reading them ahead
+    // (LLAMA_EXPERT_PREFETCH). `owner` is the model, whose routers are
+    // forgotten when it is freed.
+    GGML_BACKEND_API void ggml_cpu_expert_cache_set_router(const void * owner, int layer, const struct ggml_tensor * gate_inp,
+                                                           const struct ggml_tensor * norm, const struct ggml_tensor * bias,
+                                                           int gating, int n_used);
+    GGML_BACKEND_API void ggml_cpu_expert_cache_forget_routers(const void * owner);
 
 #ifdef __cplusplus
 }

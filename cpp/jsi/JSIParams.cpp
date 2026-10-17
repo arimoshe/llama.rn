@@ -367,6 +367,12 @@ static common_grammar makeGrammar(common_grammar_type type, std::string grammar)
             } else {
                 unsetenv("LLAMA_EXPERT_CACHE_MB");
             }
+            int prefetch = getPropertyAsInt(params, "expert_prefetch_threads", 0);
+            if (expertCacheMb > 0 && prefetch > 0) {
+                setenv("LLAMA_EXPERT_PREFETCH", std::to_string(prefetch).c_str(), 1);
+            } else {
+                unsetenv("LLAMA_EXPERT_PREFETCH");
+            }
             std::string statsFile = getPropertyAsString(params, "expert_cache_stats_file");
             if (expertCacheMb > 0 && !statsFile.empty()) {
                 setenv("LLAMA_EXPERT_CACHE_STATS_FILE", statsFile.c_str(), 1);

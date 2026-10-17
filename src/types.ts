@@ -143,8 +143,16 @@ export type NativeContextParams = {
   expert_cache_mb?: number
 
   /**
+   * With expert_cache_mb: background threads that read the next layer's
+   * likely experts while a layer runs during generation, guessed from the
+   * layer's router input (fork addition). 0 or unset: off.
+   */
+  expert_prefetch_threads?: number
+
+  /**
    * With expert_cache_mb: a file the cache rewrites with its counters (JSON:
-   * hits, misses, passthrough, readMb, usedMb, budgetMb) at the start of each
+   * hits, misses, passthrough, readMb, usedMb, budgetMb, prefetched,
+   * prefetchUsed, prefetchLate, prefetchWasted) at the start of each
    * pass through the model (fork addition).
    */
   expert_cache_stats_file?: string

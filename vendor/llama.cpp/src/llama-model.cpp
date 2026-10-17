@@ -1296,6 +1296,10 @@ llama_model::~llama_model() {
         if (clear) {
             clear();
         }
+        auto * forget = (void (*)(const void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_expert_cache_forget_routers");
+        if (forget) {
+            forget(this);
+        }
     }
 }
 
@@ -1955,6 +1959,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // the expert cache guesses each layer's experts from the layer before
+    // (ggml-cpu.c), with the routers and ffn norms it is given here
+    if (getenv("LLAMA_EXPERT_CACHE_MB") != nullptr) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto * set_router = cpu_dev ? (void (*)(const void *, int, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int))
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_cpu_expert_cache_set_router") : nullptr;
+        for (int il = 0; set_router && il < (int) layers.size(); il++) {
+            const auto & layer = layers[il];
+            if (layer.ffn_gate_inp) {
+                set_router(this, il, layer.ffn_gate_inp, layer.ffn_norm, layer.ffn_exp_probs_b,
+                           (int) hparams.expert_gating_func, (int) hparams.n_expert_used(il));
+            }
         }
     }
 
