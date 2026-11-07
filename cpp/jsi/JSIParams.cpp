@@ -5,6 +5,7 @@
 #include "speculative.h"
 #endif
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <algorithm>
 #include <list>
@@ -378,6 +379,40 @@ static common_grammar makeGrammar(common_grammar_type type, std::string grammar)
                 setenv("LLAMA_EXPERT_CACHE_STATS_FILE", statsFile.c_str(), 1);
             } else {
                 unsetenv("LLAMA_EXPERT_CACHE_STATS_FILE");
+            }
+        }
+
+        // Model metadata overrides (fork addition), e.g. a looped model's
+        // { "dory.num_loops": 2, "dory.recurrent_kv_cache_mode": "last_loop" }.
+        // A whole number is an int, any other number a float.
+        cparams.kv_overrides.clear();
+        if (params.contains("kv_overrides") && params["kv_overrides"].is_object()) {
+            for (const auto & [key, value] : params["kv_overrides"].items()) {
+                if (key.empty() || key.size() >= 128) continue;
+                llama_model_kv_override o{};
+                strncpy(o.key, key.c_str(), sizeof(o.key) - 1);
+                if (value.is_boolean()) {
+                    o.tag = LLAMA_KV_OVERRIDE_TYPE_BOOL;
+                    o.val_bool = value.get<bool>();
+                } else if (value.is_number_integer()) {
+                    o.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+                    o.val_i64 = value.get<int64_t>();
+                } else if (value.is_number()) {
+                    o.tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
+                    o.val_f64 = value.get<double>();
+                } else if (value.is_string()) {
+                    const std::string v = value.get<std::string>();
+                    if (v.size() >= sizeof(o.val_str)) continue;
+                    o.tag = LLAMA_KV_OVERRIDE_TYPE_STR;
+                    strncpy(o.val_str, v.c_str(), sizeof(o.val_str) - 1);
+                } else {
+                    continue;
+                }
+                cparams.kv_overrides.push_back(o);
+            }
+            if (!cparams.kv_overrides.empty()) {
+                cparams.kv_overrides.emplace_back();
+                cparams.kv_overrides.back().key[0] = 0;
             }
         }
 

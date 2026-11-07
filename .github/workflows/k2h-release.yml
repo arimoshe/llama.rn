@@ -80,6 +80,15 @@ jobs:
           done
           ls -la android/src/main/jniLibs/arm64-v8a bin/arm64-v8a
 
+      - name: Check Dory is in the build
+        run: |
+          for so in android/src/main/jniLibs/arm64-v8a/*.so; do
+            if ! strings -a "$so" | grep -qx 'dory'; then
+              echo "::error::$so does not contain the dory architecture"
+              exit 1
+            fi
+          done
+
       - name: Package Android JNI libraries
         run: tar -czf llama-rn-android-jni-libs.tar.gz android/src/main/jniLibs
 

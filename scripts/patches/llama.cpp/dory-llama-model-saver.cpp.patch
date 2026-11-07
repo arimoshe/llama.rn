@@ -1,0 +1,13 @@
+NVIDIA Nemotron-Labs Dory (looped normalized-GPT) support, ported from
+ggml-org/llama.cpp#30306 (brianchmielNV/llama.cpp @ 98a74c9) onto this tree.
+Drop once upstream llama.cpp merges Dory.
+--- a/src/llama-model-saver.cpp
++++ b/src/llama-model-saver.cpp
+@@ -15,6 +15,7 @@
+ 
+ bool llama_model_saver_supports_arch(llm_arch arch) {
+     switch (arch) {
++        case LLM_ARCH_DORY: // physical weights and virtual cache slots use different counts
+         case LLM_ARCH_GEMMA3N:
+         case LLM_ARCH_BITNET:
+         case LLM_ARCH_T5:

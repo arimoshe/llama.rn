@@ -160,6 +160,14 @@ export type NativeContextParams = {
   expert_cache_stats_file?: string
 
   /**
+   * Override model metadata at load (fork addition), keyed as in the GGUF.
+   * A whole number is sent as an int, any other number as a float. For
+   * NVIDIA Dory: { 'dory.num_loops': 2, 'dory.recurrent_kv_cache_mode':
+   * 'last_loop' }.
+   */
+  kv_overrides?: Record<string, number | boolean | string>
+
+  /**
    * Single LoRA adapter path
    */
   lora?: string
