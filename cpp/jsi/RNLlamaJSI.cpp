@@ -132,6 +132,59 @@ static std::string stripFileScheme(const std::string& path) {
     return path;
 }
 
+// Records llama.cpp's warnings and errors while it is installed, passing every
+// line on to the log callback that was there before. Installed around a model
+// load: the load reports failure as a bare false, and the reason is only ever
+// in the log (fork addition).
+class LoadLogCapture {
+public:
+    LoadLogCapture() {
+        llama_log_get(&prev_cb_, &prev_ud_);
+        llama_log_set(&LoadLogCapture::callback, this);
+        active_ = true;
+    }
+    ~LoadLogCapture() { stop(); }
+
+    void stop() {
+        if (!active_) return;
+        llama_log_set(prev_cb_, prev_ud_);
+        active_ = false;
+    }
+
+    // The last few warnings and errors, joined; "" when there were none.
+    std::string reason() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string out;
+        const size_t from = lines_.size() > kKeep ? lines_.size() - kKeep : 0;
+        for (size_t i = from; i < lines_.size(); i++) {
+            if (!out.empty()) out += " | ";
+            out += lines_[i];
+        }
+        return out;
+    }
+
+private:
+    static constexpr size_t kKeep = 4;
+
+    static void callback(ggml_log_level level, const char * text, void * user_data) {
+        auto * self = static_cast<LoadLogCapture *>(user_data);
+        if (self->prev_cb_) self->prev_cb_(level, text, self->prev_ud_);
+        if (level != GGML_LOG_LEVEL_WARN && level != GGML_LOG_LEVEL_ERROR) return;
+        std::string line(text ? text : "");
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty()) return;
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        self->lines_.push_back(line);
+        if (self->lines_.size() > 64) self->lines_.erase(self->lines_.begin());
+    }
+
+    ggml_log_callback prev_cb_ = nullptr;
+    void * prev_ud_ = nullptr;
+    bool active_ = false;
+    std::mutex mutex_;
+    std::vector<std::string> lines_;
+};
+
 namespace rnllama_jsi {
     static std::atomic<int64_t> g_context_limit(-1);
 #if defined(__ANDROID__)
@@ -685,7 +738,13 @@ namespace rnllama_jsi {
                             stateCacheBudgetMb > 0 ? (size_t) stateCacheBudgetMb * 1024 * 1024 : 0;
                         ctx->state_cache_max_checkpoints = stateCacheMaxCheckpoints;
                     }
-                    if (ctx->loadModel(cparams)) {
+                    // What llama.cpp said while loading, so a failed load can
+                    // say why instead of only "Failed to load model".
+                    LoadLogCapture loadLog;
+                    const bool loaded = ctx->loadModel(cparams);
+                    const std::string loadWhy = loadLog.reason();
+                    loadLog.stop();
+                    if (loaded) {
                          ctx->attachThreadpoolsIfAvailable();
 
                          if (ctx->params.embedding && llama_model_has_encoder(ctx->model) && llama_model_has_decoder(ctx->model)) {
@@ -749,7 +808,9 @@ namespace rnllama_jsi {
                          };
                     } else {
                         delete ctx;
-                        throw std::runtime_error("Failed to load model");
+                        throw std::runtime_error(loadWhy.empty()
+                            ? std::string("Failed to load model")
+                            : "Failed to load model: " + loadWhy);
                     }
                 }, contextId);
             }

@@ -384,7 +384,11 @@ static common_grammar makeGrammar(common_grammar_type type, std::string grammar)
 
         // Model metadata overrides (fork addition), e.g. a looped model's
         // { "dory.num_loops": 2, "dory.recurrent_kv_cache_mode": "last_loop" }.
-        // A whole number is an int, any other number a float.
+        // A whole number is an int, any other number a float. JavaScript has
+        // one number type and every number arrives here as a double, so the
+        // whole-number test is on the value: sent as a float, an int key's
+        // override is refused with only a warning and the file's value used
+        // (Dory then ran its file's 4 loops, not the 2 asked for).
         cparams.kv_overrides.clear();
         if (params.contains("kv_overrides") && params["kv_overrides"].is_object()) {
             for (const auto & [key, value] : params["kv_overrides"].items()) {
@@ -394,9 +398,12 @@ static common_grammar makeGrammar(common_grammar_type type, std::string grammar)
                 if (value.is_boolean()) {
                     o.tag = LLAMA_KV_OVERRIDE_TYPE_BOOL;
                     o.val_bool = value.get<bool>();
-                } else if (value.is_number_integer()) {
+                } else if (value.is_number_integer() ||
+                           (value.is_number_float() && std::isfinite(value.get<double>()) &&
+                            std::trunc(value.get<double>()) == value.get<double>() &&
+                            std::fabs(value.get<double>()) < 9.0e15)) {
                     o.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
-                    o.val_i64 = value.get<int64_t>();
+                    o.val_i64 = value.is_number_integer() ? value.get<int64_t>() : (int64_t) value.get<double>();
                 } else if (value.is_number()) {
                     o.tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT;
                     o.val_f64 = value.get<double>();

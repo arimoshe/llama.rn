@@ -161,7 +161,8 @@ export type NativeContextParams = {
 
   /**
    * Override model metadata at load (fork addition), keyed as in the GGUF.
-   * A whole number is sent as an int, any other number as a float. For
+   * A whole number is sent as an int, any other number as a float (so a
+   * float key cannot be given a whole value here). For
    * NVIDIA Dory: { 'dory.num_loops': 2, 'dory.recurrent_kv_cache_mode':
    * 'last_loop' }.
    */

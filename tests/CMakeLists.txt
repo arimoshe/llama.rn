@@ -114,6 +114,18 @@ endif()
 
 rnllama_test(barbet_hidden_dump barbet_hidden_dump.cpp NATIVE_SIMD)
 
+# Loads a model through llama_rn_context with the app's settings, to
+# reproduce on a host a load that fails on the phone.
+rnllama_test(dory_load_probe dory_load_probe.cpp NATIVE_SIMD)
+
+# kv_overrides through JSIParams' parser, with JavaScript's doubles.
+rnllama_test(kv_overrides_test kv_overrides_test.cpp NATIVE_SIMD SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cpp/jsi/JSIParams.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../node_modules/react-native/ReactCommon/jsi/jsi/jsi.cpp)
+target_include_directories(kv_overrides_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cpp/jsi
+    ${CMAKE_CURRENT_SOURCE_DIR}/../node_modules/react-native/ReactCommon/jsi)
+
 # KV-cache-reuse harness
 rnllama_test(kv_cache_reuse_test kv_cache_reuse_test.cpp)
 
