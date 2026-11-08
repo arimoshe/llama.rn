@@ -8,6 +8,7 @@
 #include "nlohmann/json.hpp"
 #include "chat.h"
 #include "speculative.h"
+#include <atomic>
 #include <deque>
 
 using json = nlohmann::ordered_json;
@@ -96,6 +97,15 @@ struct llama_rn_context_completion {
     llama_pos n_past = 0;
     size_t n_remain = 0;
     std::vector<llama_token> embd;
+
+    // How far through reading the prompt the current completion is, for a
+    // progress readout (llamaGetPrefillProgress): tokens of the prompt in the
+    // cache so far, the prompt's length, and how many were already cached when
+    // reading began. Written by the completion thread after each batch, read
+    // from JS, hence atomic. total 0 until a prompt is read.
+    std::atomic<int32_t> prefill_done{0};
+    std::atomic<int32_t> prefill_total{0};
+    std::atomic<int32_t> prefill_start{0};
 
     // --- Prompt state cache (recurrent / hybrid / SWA prefix reuse) ----------
     // Saved snapshots, oldest first; empty for pure-attention models (seq_rm

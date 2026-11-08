@@ -1314,6 +1314,28 @@ namespace rnllama_jsi {
         );
         runtime.global().setProperty(runtime, "llamaStopCompletion", stopCompletion);
 
+        // How far the completion in progress has read its prompt: { done,
+        // total, start } in tokens (start: already cached when reading
+        // began), or null before any prompt has been read. Cheap: three atomic
+        // loads, safe to poll while the completion runs on its own thread.
+        auto getPrefillProgress = jsi::Function::createFromHostFunction(runtime,
+            jsi::PropNameID::forAscii(runtime, "llamaGetPrefillProgress"),
+            1,
+            [](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* arguments, size_t count) -> jsi::Value {
+                int contextId = (int)arguments[0].asNumber();
+                auto ctx = getContextOrThrow(contextId);
+                if (!ctx->completion) return jsi::Value::null();
+                const int32_t total = ctx->completion->prefill_total.load(std::memory_order_relaxed);
+                if (total <= 0) return jsi::Value::null();
+                jsi::Object out(runtime);
+                out.setProperty(runtime, "done", (double) ctx->completion->prefill_done.load(std::memory_order_relaxed));
+                out.setProperty(runtime, "total", (double) total);
+                out.setProperty(runtime, "start", (double) ctx->completion->prefill_start.load(std::memory_order_relaxed));
+                return out;
+            }
+        );
+        runtime.global().setProperty(runtime, "llamaGetPrefillProgress", getPrefillProgress);
+
         auto toggleNativeLog = jsi::Function::createFromHostFunction(runtime,
             jsi::PropNameID::forAscii(runtime, "llamaToggleNativeLog"),
             2,

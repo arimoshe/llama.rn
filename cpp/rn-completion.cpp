@@ -1356,6 +1356,15 @@ completion_token_output llama_rn_context_completion::nextToken()
             : 0;
 
     bool tg = true;
+    // More than one token to decode is a prompt being read: publish how far it
+    // has got after each batch (prefill_* in rn-completion.h). Generation
+    // decodes one token at a time and leaves these alone.
+    const bool reading_prompt = (llama_pos) embd.size() - n_past > 1;
+    if (reading_prompt) {
+        prefill_start.store((int32_t) n_past, std::memory_order_relaxed);
+        prefill_done.store((int32_t) n_past, std::memory_order_relaxed);
+        prefill_total.store((int32_t) embd.size(), std::memory_order_relaxed);
+    }
     while (n_past < embd.size())
     {
         llama_pos decode_to = (llama_pos) embd.size();
@@ -1488,6 +1497,7 @@ completion_token_output llama_rn_context_completion::nextToken()
             }
         }
         n_past += n_eval;
+        if (reading_prompt) prefill_done.store((int32_t) n_past, std::memory_order_relaxed);
 
         // For continuous / codec_lm-AR TTS: run one codec_lm step once
         // we've fully decoded the current pending sequence (prompt or

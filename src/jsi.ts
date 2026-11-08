@@ -87,6 +87,9 @@ declare global {
     onToken?: (token: any) => void,
   ) => Promise<NativeCompletionResult>
   var llamaStopCompletion: (contextId: number) => Promise<void>
+  var llamaGetPrefillProgress: (
+    contextId: number,
+  ) => { done: number; total: number; start: number } | null
   var llamaApplyLoraAdapters: (
     contextId: number,
     adapters: Array<{ path: string; scaled?: number }>,

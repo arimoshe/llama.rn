@@ -113,6 +113,7 @@ const jsiBindingKeys = [
   'llamaSetContextLimit',
   'llamaCompletion',
   'llamaStopCompletion',
+  'llamaGetPrefillProgress',
   'llamaApplyLoraAdapters',
   'llamaRemoveLoraAdapters',
   'llamaGetLoadedLoraAdapters',
@@ -926,6 +927,17 @@ export class LlamaContext {
   stopCompletion(): Promise<void> {
     const { llamaStopCompletion } = getJsi()
     return llamaStopCompletion(this.id)
+  }
+
+  /**
+   * How far the completion in progress has read its prompt, in tokens:
+   * `done` of `total`, `start` of them already cached when reading began.
+   * Null before any prompt has been read. Synchronous and cheap, for polling
+   * a progress readout while a completion runs.
+   */
+  getPrefillProgress(): { done: number; total: number; start: number } | null {
+    const { llamaGetPrefillProgress } = getJsi()
+    return llamaGetPrefillProgress(this.id)
   }
 
   tokenize(
