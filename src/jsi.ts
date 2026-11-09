@@ -87,6 +87,11 @@ declare global {
     onToken?: (token: any) => void,
   ) => Promise<NativeCompletionResult>
   var llamaStopCompletion: (contextId: number) => Promise<void>
+  var llamaSetThreads: (
+    contextId: number,
+    threads: number,
+    threadsBatch?: number,
+  ) => { threads: number; threadsBatch: number } | null
   var llamaGetPrefillProgress: (
     contextId: number,
   ) => { done: number; total: number; start: number } | null

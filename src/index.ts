@@ -114,6 +114,7 @@ const jsiBindingKeys = [
   'llamaCompletion',
   'llamaStopCompletion',
   'llamaGetPrefillProgress',
+  'llamaSetThreads',
   'llamaApplyLoraAdapters',
   'llamaRemoveLoraAdapters',
   'llamaGetLoadedLoraAdapters',
@@ -938,6 +939,17 @@ export class LlamaContext {
   getPrefillProgress(): { done: number; total: number; start: number } | null {
     const { llamaGetPrefillProgress } = getJsi()
     return llamaGetPrefillProgress(this.id)
+  }
+
+  /**
+   * Sets how many CPU threads the context computes with (generation, and
+   * prompt batches: `threadsBatch`, defaulting to `threads`), from the next
+   * decode on, without reloading. The worker threads are created at load
+   * with `n_threads`, so a higher count is capped to that.
+   */
+  setThreads(threads: number, threadsBatch?: number): { threads: number; threadsBatch: number } | null {
+    const { llamaSetThreads } = getJsi()
+    return llamaSetThreads(this.id, threads, threadsBatch)
   }
 
   tokenize(

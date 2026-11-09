@@ -1336,6 +1336,29 @@ namespace rnllama_jsi {
         );
         runtime.global().setProperty(runtime, "llamaGetPrefillProgress", getPrefillProgress);
 
+        // Changes how many CPU threads the context computes with, from the
+        // next decode on, without reloading: for a governor that eases off as
+        // the phone warms. The worker threads are made at load (n_threads), so
+        // a count above that is capped by ggml to the pool's size; below it,
+        // the spare workers sleep. Returns the counts now set.
+        auto setThreads = jsi::Function::createFromHostFunction(runtime,
+            jsi::PropNameID::forAscii(runtime, "llamaSetThreads"),
+            3,
+            [](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* arguments, size_t count) -> jsi::Value {
+                int contextId = (int)arguments[0].asNumber();
+                auto ctx = getContextOrThrow(contextId);
+                if (!ctx->ctx) return jsi::Value::null();
+                const int32_t n = std::max(1, (int)arguments[1].asNumber());
+                const int32_t n_batch = count > 2 && arguments[2].isNumber() ? std::max(1, (int)arguments[2].asNumber()) : n;
+                llama_set_n_threads(ctx->ctx, n, n_batch);
+                jsi::Object out(runtime);
+                out.setProperty(runtime, "threads", (double) llama_n_threads(ctx->ctx));
+                out.setProperty(runtime, "threadsBatch", (double) llama_n_threads_batch(ctx->ctx));
+                return out;
+            }
+        );
+        runtime.global().setProperty(runtime, "llamaSetThreads", setThreads);
+
         auto toggleNativeLog = jsi::Function::createFromHostFunction(runtime,
             jsi::PropNameID::forAscii(runtime, "llamaToggleNativeLog"),
             2,
