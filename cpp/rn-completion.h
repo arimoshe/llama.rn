@@ -151,6 +151,14 @@ struct llama_rn_context_completion {
     // Speculative decoding context for MTP.
     common_speculative *spec = nullptr;
     llama_context_ptr spec_ctx;
+    // The draft context this turn's speculator drives: spec_ctx for MTP, the
+    // context's persistent block draft (parent_ctx->block_draft) for
+    // dspark/dflash, which is not owned here.
+    llama_context *spec_ctx_dft = nullptr;
+    bool spec_block = false;
+    // False while a refill has fed the block draft tokens it has not yet
+    // trimmed back to spec_prompt; the draft's cache is then not trusted.
+    bool spec_draft_in_sync = false;
     llama_batch spec_batch = {};
     bool spec_batch_initialized = false;
     llama_tokens spec_prompt;
@@ -209,6 +217,8 @@ struct llama_rn_context_completion {
     void updateGenerationTiming();
     completion_token_output nextToken();
     bool shouldUseMTP() const;
+    // A block draft (dspark/dflash) is loaded and asked for on this call.
+    bool shouldUseBlockDraft() const;
     void resetSpeculative();
     void initMTP();
     void evalMTPPrompt();

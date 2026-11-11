@@ -9,6 +9,13 @@ export type NativeSpeculativeType =
    * Alias for draft-mtp.
    */
   | 'mtp'
+  /**
+   * Block drafts: a separate draft model (`model_draft`) that reads the
+   * target's hidden layers and proposes a block of tokens at once. Loaded
+   * once with the context and kept; text-only, pure-attention targets.
+   */
+  | 'draft-dspark'
+  | 'draft-dflash'
 
 export type NativeSpeculativeParams = {
   enabled?: boolean

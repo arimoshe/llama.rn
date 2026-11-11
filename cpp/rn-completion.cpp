@@ -687,18 +687,44 @@ void llama_rn_context_completion::updateGenerationTiming() {
     }
 }
 
-bool llama_rn_context_completion::shouldUseMTP() const {
+bool llama_rn_context_completion::shouldUseBlockDraft() const {
     const auto & types = parent_ctx->params.speculative.types;
-    return std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() &&
+    const bool asked =
+        std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != types.end() ||
+        std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
+    return asked && parent_ctx->blockDraftContext() != nullptr &&
         parent_ctx->params.speculative.draft.n_max > 0;
 }
 
+// The speculative path: MTP, or a block draft. (The name predates block drafts.)
+bool llama_rn_context_completion::shouldUseMTP() const {
+    const auto & types = parent_ctx->params.speculative.types;
+    const bool mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end() &&
+        parent_ctx->params.speculative.draft.n_max > 0;
+    return mtp || shouldUseBlockDraft();
+}
+
 void llama_rn_context_completion::resetSpeculative() {
+    if (spec_block) {
+        // The block draft outlives the turn: record what its cache holds, or
+        // drop it when a refill did not finish.
+        if (spec != nullptr && spec_draft_in_sync) {
+            parent_ctx->block_draft_tokens = spec_prompt;
+        } else {
+            parent_ctx->block_draft_tokens.clear();
+            if (llama_context * dft = parent_ctx->blockDraftContext()) {
+                llama_memory_clear(llama_get_memory(dft), false);
+            }
+        }
+    }
     if (spec != nullptr) {
         common_speculative_free(spec);
         spec = nullptr;
     }
     spec_ctx.reset();
+    spec_ctx_dft = nullptr;
+    spec_block = false;
+    spec_draft_in_sync = false;
     if (spec_batch_initialized) {
         llama_batch_free(spec_batch);
         spec_batch = {};
@@ -732,17 +758,37 @@ void llama_rn_context_completion::initMTP() {
 
     resetSpeculative();
 
-    spec_ctx.reset(parent_ctx->createMTPDraftContext(parent_ctx->params));
-    if (spec_ctx == nullptr) {
-        throw std::runtime_error("failed to create MTP draft context");
+    const bool block = shouldUseBlockDraft();
+    // A block draft and MTP are separate paths; with both asked for, the
+    // loaded block draft wins and MTP is left out of this turn.
+    common_params_speculative spec_params = parent_ctx->params.speculative;
+    if (block) {
+        spec_ctx_dft = parent_ctx->blockDraftContext();
+        spec_params.types.erase(
+            std::remove(spec_params.types.begin(), spec_params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP),
+            spec_params.types.end());
+    } else {
+        spec_ctx.reset(parent_ctx->createMTPDraftContext(parent_ctx->params));
+        if (spec_ctx == nullptr) {
+            throw std::runtime_error("failed to create MTP draft context");
+        }
+        spec_ctx_dft = spec_ctx.get();
+        spec_params.types.erase(
+            std::remove_if(spec_params.types.begin(), spec_params.types.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            }),
+            spec_params.types.end());
     }
+    spec_block = block;
 
+    spec_params.draft.ctx_tgt = parent_ctx->ctx;
+    spec_params.draft.ctx_dft = spec_ctx_dft;
     parent_ctx->params.speculative.draft.ctx_tgt = parent_ctx->ctx;
-    parent_ctx->params.speculative.draft.ctx_dft = spec_ctx.get();
+    parent_ctx->params.speculative.draft.ctx_dft = spec_ctx_dft;
 
-    spec = common_speculative_init(parent_ctx->params.speculative, 1);
+    spec = common_speculative_init(spec_params, 1);
     if (spec == nullptr) {
-        throw std::runtime_error("failed to initialize MTP speculative decoding");
+        throw std::runtime_error("failed to initialize speculative decoding");
     }
 
     spec_batch = llama_batch_init(llama_n_batch(parent_ctx->ctx), 0, 1);
@@ -752,7 +798,9 @@ void llama_rn_context_completion::initMTP() {
     // upstream state save/restore is a no-op — restoring a checkpoint would leave
     // stale speculative cells and corrupt the output. Disable the cache for it
     // (full-reprocess each turn) until upstream supports shared-cell restore.
-    if (llama_get_ctx_other(spec_ctx.get()) == parent_ctx->ctx) {
+    // A block draft has a cache of its own; ctx_other only lends it the
+    // target's embeddings and output head.
+    if (!block && llama_get_ctx_other(spec_ctx_dft) == parent_ctx->ctx) {
         if (state_cache_enabled) {
             LOG_INFO("state cache disabled for this turn: mem-shared MTP draft "
                      "(shared-cell state restore is unsupported upstream)");
@@ -784,6 +832,29 @@ void llama_rn_context_completion::evalMTPPrompt() {
     // Reuse whatever prefix loadPrompt already left in the (shared) target
     // memory: it set n_past to the reused position. Decode only the diverged tail.
     size_t offset = std::min((size_t) std::max<llama_pos>(0, n_past), spec_prompt.size());
+
+    // A block draft needs the target's features for every position in its
+    // cache. It holds them for block_draft_tokens; where those part from this
+    // prompt sooner than the target's reused prefix does, the target reads
+    // that stretch again so the draft can see it.
+    if (spec_block) {
+        auto & held = parent_ctx->block_draft_tokens;
+        size_t n_held = 0;
+        while (n_held < held.size() && n_held < spec_prompt.size() && held[n_held] == spec_prompt[n_held]) {
+            n_held++;
+        }
+        if (n_held < offset) {
+            if (!llama_memory_seq_rm(llama_get_memory(parent_ctx->ctx), seq_id, (llama_pos) n_held, -1)) {
+                llama_memory_clear(llama_get_memory(parent_ctx->ctx), false);
+                n_held = 0;
+            }
+            LOG_INFO("block draft: re-reading %zu prompt tokens the draft has not seen", offset - n_held);
+            offset = n_held;
+        }
+        llama_memory_seq_rm(llama_get_memory(spec_ctx_dft), seq_id, (llama_pos) offset, -1);
+        held.clear();
+        spec_draft_in_sync = false;
+    }
     const size_t start_offset = offset;
 
     while (offset < spec_prompt.size()) {
@@ -838,6 +909,7 @@ void llama_rn_context_completion::evalMTPPrompt() {
 
     spec_n_past = (llama_pos) spec_prompt.size();
     n_past = spec_n_past;
+    spec_draft_in_sync = true;
 
     common_speculative_begin(spec, seq_id, spec_prompt);
 }
@@ -890,7 +962,7 @@ bool llama_rn_context_completion::refillMTPTokens() {
         }
 
         common_memory memory;
-        memory.init(spec_ctx.get());
+        memory.init(spec_ctx_dft);
         memory.seq_rm(seq_id, spec_n_past, -1);
     }
 
@@ -904,6 +976,7 @@ bool llama_rn_context_completion::refillMTPTokens() {
                          spec_n_past + (llama_pos) i + 1, { seq_id }, true);
     }
 
+    spec_draft_in_sync = false;
     const int ret = llama_decode(parent_ctx->ctx, spec_batch);
     if (ret != 0) {
         throw std::runtime_error("failed to evaluate MTP target batch, ret=" + std::to_string(ret));
@@ -951,8 +1024,9 @@ bool llama_rn_context_completion::refillMTPTokens() {
     n_past = spec_n_past;
 
     common_memory memory;
-    memory.init(parent_ctx->ctx, spec_ctx.get());
+    memory.init(parent_ctx->ctx, spec_ctx_dft);
     memory.seq_rm(seq_id, spec_n_past, -1);
+    spec_draft_in_sync = true;
 
     if (saw_eos) {
         stopped_eos = true;
@@ -986,6 +1060,11 @@ completion_token_output llama_rn_context_completion::nextTokenMTP() {
 
     result = std::move(spec_pending_tokens.front());
     spec_pending_tokens.pop_front();
+    // As nextToken does: embd is what the next turn's prompt is matched
+    // against, so without the reply in it every turn re-read the last reply.
+    // The cache holds at least these (spec_prompt runs ahead by the tokens
+    // still pending), so a match on embd is always a valid reuse.
+    embd.push_back(result.tok);
     num_tokens_predicted++;
     updateGenerationTiming();
     has_next_token = !spec_pending_tokens.empty() || (!stopped_eos && !stopped_limit && !context_full);

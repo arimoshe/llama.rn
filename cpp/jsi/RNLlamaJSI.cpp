@@ -1185,7 +1185,7 @@ namespace rnllama_jsi {
                     }
 
                     if (!mediaPaths.empty() && ctx->completion->shouldUseMTP()) {
-                        throw std::runtime_error("MTP speculative decoding currently supports text-only completion");
+                        throw std::runtime_error("Speculative decoding (MTP, DSpark) currently supports text-only completion");
                     }
 
                     // NOTE: no rewind() here — it already ran on the JS thread
@@ -1351,6 +1351,9 @@ namespace rnllama_jsi {
                 const int32_t n = std::max(1, (int)arguments[1].asNumber());
                 const int32_t n_batch = count > 2 && arguments[2].isNumber() ? std::max(1, (int)arguments[2].asNumber()) : n;
                 llama_set_n_threads(ctx->ctx, n, n_batch);
+                if (llama_context * dft = ctx->blockDraftContext()) {
+                    llama_set_n_threads(dft, n, n_batch);
+                }
                 jsi::Object out(runtime);
                 out.setProperty(runtime, "threads", (double) llama_n_threads(ctx->ctx));
                 out.setProperty(runtime, "threadsBatch", (double) llama_n_threads_batch(ctx->ctx));

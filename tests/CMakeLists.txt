@@ -135,3 +135,6 @@ rnllama_test(kv_cache_bench kv_cache_bench.cpp)
 if(KV_BENCH_HAS_STATE_CACHE)
     target_compile_definitions(kv_cache_bench PRIVATE KV_BENCH_HAS_STATE_CACHE)
 endif()
+
+# DSpark block drafts through the app's completion path (plain vs drafted).
+rnllama_test(dspark_probe dspark_probe.cpp NATIVE_SIMD)

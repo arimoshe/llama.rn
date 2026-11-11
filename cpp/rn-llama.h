@@ -15,6 +15,7 @@
 #include "llama-model.h"
 #include "llama-impl.h"
 #include "sampling.h"
+#include "speculative.h"
 #include "nlohmann/json.hpp"
 #include "rn-tts.h"
 #if defined(__ANDROID__)
@@ -117,6 +118,15 @@ struct llama_rn_context {
     bool post_sampling_probs = true;
     common_init_result_ptr llama_init;
     llama_context *ctx = nullptr;
+    // Block drafts (draft-dspark / draft-dflash): the draft model and its own
+    // context, made once at load and kept, since the draft's KV cache holds the
+    // target's features for the whole conversation. Declared after llama_init
+    // so it is freed first (its context points at the target's).
+    common_speculative_init_result_ptr block_draft;
+    // The tokens whose target features the block draft's KV cache holds, in
+    // order from position 0. A turn compares its prompt with these to know how
+    // much of the draft's cache it can keep.
+    std::vector<llama_token> block_draft_tokens;
     common_chat_templates_ptr templates;
     int n_ctx = 0;
 
@@ -146,6 +156,8 @@ struct llama_rn_context {
     bool hasDraftModel() const;
     llama_model * getMTPDraftModel() const;
     llama_context * createMTPDraftContext(const common_params &params_for_context) const;
+    // The block draft's context, or nullptr when none is loaded.
+    llama_context * blockDraftContext() const;
     void cleanupThreadpools();
     bool attachThreadpoolsIfAvailable();
 

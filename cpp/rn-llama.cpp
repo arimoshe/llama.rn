@@ -452,6 +452,9 @@ void llama_rn_context::cleanupThreadpools() {
     if (ctx != nullptr && (threadpool != nullptr || threadpool_batch != nullptr)) {
         llama_detach_threadpool(ctx);
     }
+    if (llama_context * dft = blockDraftContext(); dft != nullptr && (threadpool != nullptr || threadpool_batch != nullptr)) {
+        llama_detach_threadpool(dft);
+    }
 
     if (threadpool_batch != nullptr) {
         ggml_threadpool_free(threadpool_batch);
@@ -510,6 +513,12 @@ bool llama_rn_context::attachThreadpoolsIfAvailable() {
     }
 
     llama_attach_threadpool(ctx, new_threadpool, new_batch);
+    // The block draft computes between the target's steps, never beside them:
+    // on its own threads it would fight the target's (still spinning) for the
+    // same cores, which made every drafted step 2-3x slower.
+    if (llama_context * dft = blockDraftContext()) {
+        llama_attach_threadpool(dft, new_threadpool, new_batch);
+    }
     threadpool = new_threadpool;
     threadpool_batch = new_batch;
     LOG_INFO("Attached ggml threadpool (n_threads=%d, n_threads_batch=%d)",
@@ -529,6 +538,9 @@ llama_rn_context::~llama_rn_context() {
         delete completion;
         completion = nullptr;
     }
+    // Before the target context it points at.
+    block_draft.reset();
+    block_draft_tokens.clear();
 
     releaseMultimodal();
     releaseVocoder();
@@ -537,6 +549,12 @@ llama_rn_context::~llama_rn_context() {
 bool llama_rn_context::loadModel(common_params &params_)
 {
     removeLoraAdapters();
+    // A speculator from an earlier load points at contexts about to go.
+    if (completion != nullptr) {
+        completion->resetSpeculative();
+    }
+    block_draft.reset();
+    block_draft_tokens.clear();
     draft_model.reset();
     params = params_;
 
@@ -596,6 +614,26 @@ bool llama_rn_context::loadModel(common_params &params_)
         }
     }
 
+    if (params.speculative.has_dft() &&
+        (has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
+         has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH))) {
+        if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
+            LOG_ERROR("block drafts (dspark/dflash) need a pure-attention target model");
+            return false;
+        }
+        // Upstream's own setup (llama-speculative-simple / server): the draft
+        // gets the target's context length and ctx_other = target, from which
+        // it borrows the embeddings and output head it does not carry.
+        common_params params_dft = common_base_params_to_speculative(params);
+        LOG_INFO("Loading block draft model: %s", params_dft.model.path.c_str());
+        block_draft = common_speculative_init_from_params(params_dft, model, ctx);
+        if (block_draft == nullptr || block_draft->context() == nullptr) {
+            LOG_ERROR("unable to load block draft model: %s", params_dft.model.path.c_str());
+            block_draft.reset();
+            return false;
+        }
+    }
+
     templates = common_chat_templates_init(model, params.chat_template);
     n_ctx = llama_n_ctx(ctx);
 
@@ -629,6 +667,10 @@ bool llama_rn_context::loadModel(common_params &params_)
 
 bool llama_rn_context::hasDraftModel() const {
     return draft_model != nullptr;
+}
+
+llama_context * llama_rn_context::blockDraftContext() const {
+    return block_draft != nullptr ? block_draft->context() : nullptr;
 }
 
 llama_model * llama_rn_context::getMTPDraftModel() const {
