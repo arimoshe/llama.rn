@@ -374,6 +374,14 @@ static common_grammar makeGrammar(common_grammar_type type, std::string grammar)
             } else {
                 unsetenv("LLAMA_EXPERT_PREFETCH");
             }
+            // The cache is capped at the memory available less a reserve
+            // (ggml-cpu.c); this lifts the cap, so Android must find the room
+            // (closing background apps, or swapping).
+            if (expertCacheMb > 0 && getPropertyAsBool(params, "expert_cache_no_cap", false)) {
+                setenv("LLAMA_EXPERT_CACHE_NO_CAP", "1", 1);
+            } else {
+                unsetenv("LLAMA_EXPERT_CACHE_NO_CAP");
+            }
             std::string statsFile = getPropertyAsString(params, "expert_cache_stats_file");
             if (expertCacheMb > 0 && !statsFile.empty()) {
                 setenv("LLAMA_EXPERT_CACHE_STATS_FILE", statsFile.c_str(), 1);

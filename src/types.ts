@@ -157,6 +157,13 @@ export type NativeContextParams = {
   expert_prefetch_threads?: number
 
   /**
+   * With expert_cache_mb: do not cap the cache at the memory available less
+   * a 2 GB reserve; Android must make room (closing background apps, or
+   * swapping, which the stats show) (fork addition). Default false.
+   */
+  expert_cache_no_cap?: boolean
+
+  /**
    * With expert_cache_mb: a file the cache rewrites with its counters (JSON:
    * hits, misses, passthrough, readMb, usedMb, budgetMb, prefetched,
    * prefetchUsed, prefetchLate, prefetchWasted, and where generation passes'
