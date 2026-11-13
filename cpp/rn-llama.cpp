@@ -617,10 +617,9 @@ bool llama_rn_context::loadModel(common_params &params_)
     if (params.speculative.has_dft() &&
         (has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
          has_speculative_type(params.speculative, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH))) {
-        if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
-            LOG_ERROR("block drafts (dspark/dflash) need a pure-attention target model");
-            return false;
-        }
+        // Recurrent/hybrid targets (Qwen3.5, MiniCPM-V 4.7) roll rejected
+        // guesses back through the state slots common_context_params_to_llama
+        // reserved for these types (n_rs_seq = n_max), as upstream does.
         // Upstream's own setup (llama-speculative-simple / server): the draft
         // gets the target's context length and ctx_other = target, from which
         // it borrows the embeddings and output head it does not carry.

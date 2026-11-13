@@ -80,16 +80,23 @@ Turn run(llama_rn_context & ctx, const std::string & prompt, bool drafted, int n
     c->initSampling();
     c->loadPrompt({});
     t.reused = (size_t) c->n_past;
+    if (std::getenv("PROBE_DEBUG")) fprintf(stderr, "DEBUG loadPrompt: reused=%d of %zu\n", (int) c->n_past, c->embd.size());
     c->beginCompletion();
     while (c->has_next_token && (int) t.tokens < max_new) {
         completion_token_output out = c->nextToken();
+        // As the JSI loop does: drain on has_next_token. The speculative path
+        // marks EOS while tokens of the accepted block are still pending.
         if (out.tok == -1) break;
-        if (c->stopped_eos || c->is_interrupted) break;
+        if (c->is_interrupted) break;
         t.reply += out.text;
         t.tokens++;
         if (c->stopped_limit) break;
     }
     c->endCompletion();
+    if (std::getenv("PROBE_DEBUG")) {
+        fprintf(stderr, "DEBUG after turn: embd=%zu n_past=%d pos_max=%d pos_min=%d\n", c->embd.size(), (int) c->n_past,
+            (int) llama_memory_seq_pos_max(llama_get_memory(ctx.ctx), 0), (int) llama_memory_seq_pos_min(llama_get_memory(ctx.ctx), 0));
+    }
     t.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     t.drafted = c->num_draft_tokens;
     t.accepted = c->num_draft_tokens_accepted;

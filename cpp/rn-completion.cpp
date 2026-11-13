@@ -662,6 +662,23 @@ void llama_rn_context_completion::beginCompletion(int chat_format, common_reason
 void llama_rn_context_completion::endCompletion() {
     generated_text += utf8_gate.finish();
     incomplete = false;
+    // The speculative path decodes a whole accepted block before handing its
+    // tokens out one by one, so a stop (word, limit, interrupt) can leave the
+    // cache holding tokens never emitted. Roll them back now, while they are
+    // inside the rollback window: a recurrent/hybrid cache cannot be trimmed
+    // there later, and the next turn would fall back to an older snapshot.
+    if (spec != nullptr && spec_n_past > (llama_pos) embd.size()) {
+        const llama_pos keep = (llama_pos) embd.size();
+        if (llama_memory_seq_rm(llama_get_memory(parent_ctx->ctx), 0, keep, -1)) {
+            if (spec_ctx_dft != nullptr) {
+                llama_memory_seq_rm(llama_get_memory(spec_ctx_dft), 0, keep, -1);
+            }
+            spec_prompt.resize(std::min(spec_prompt.size(), (size_t) keep));
+            spec_pending_tokens.clear();
+            spec_n_past = keep;
+            n_past = keep;
+        }
+    }
     // Trim the undecoded final token. On a stop-word / token-budget stop the last
     // sampled token is already pushed to embd but never decoded.
     if (n_past > 0 && n_past < (llama_pos) embd.size()) {
@@ -752,8 +769,8 @@ void llama_rn_context_completion::initMTP() {
     if ((llama_model_is_recurrent(parent_ctx->model) || llama_model_is_hybrid(parent_ctx->model)) &&
         llama_n_rs_seq(parent_ctx->ctx) < (uint32_t) n_mtp) {
         throw std::runtime_error(
-            "MTP for recurrent or hybrid models must be enabled when loading the model "
-            "with speculative.type='draft-mtp' and speculative.n_max/spec_draft_n_max set");
+            "speculative decoding on a recurrent or hybrid model must be enabled when loading it, "
+            "with speculative.type and a spec_draft_n_max at least this call's (" + std::to_string(n_mtp) + ")");
     }
 
     resetSpeculative();
