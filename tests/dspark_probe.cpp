@@ -146,6 +146,14 @@ int main(int argc, char ** argv) {
     const int max_new = 120;
 
     std::vector<Turn> plain, drafted, mixed;
+    // Plain turns only: with LLAMA_EXPERT_CACHE_* set, a quick streaming check.
+    if (std::getenv("PROBE_PLAIN_ONLY")) {
+        llama_rn_context ctx;
+        if (!load(ctx, argv[1], nullptr, n_max, threads)) return 1;
+        plain = chat(ctx, 0, n_max, max_new);
+        print("plain", plain);
+        return 0;
+    }
     {
         llama_rn_context ctx;
         if (!load(ctx, argv[1], nullptr, n_max, threads)) { fprintf(stderr, "plain load failed\n"); return 1; }

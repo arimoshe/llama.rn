@@ -767,13 +767,13 @@
 +        for (int i = 0; i < n_embd; i++) {
 +            x[i] = rescale ? (rc->norm[i] != 0.0f ? in[i] / rc->norm[i] * rn->norm[i] : 0.0f) : in[i];
 +        }
++        // The router is n_expert dot products of n_embd: the SIMD kernel, not
++        // a scalar loop, which cost ~0.8 ms a layer (33 ms a token over 40
++        // layers on 4 x86 cores, a sixth of the token) on a 256-expert model.
 +        float max = -INFINITY;
 +        for (int e = 0; e < n_expert; e++) {
-+            const float * w = rn->w + (size_t) e*n_embd;
 +            float acc = 0.0f;
-+            for (int i = 0; i < n_embd; i++) {
-+                acc += w[i]*x[i];
-+            }
++            ggml_vec_dot_f32(n_embd, &acc, 0, rn->w + (size_t) e*n_embd, 0, x, 0, 1);
 +            score[e] = acc;
 +            max = MAX(max, acc);
 +        }
