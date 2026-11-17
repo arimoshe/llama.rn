@@ -7854,8 +7854,19 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+// Shared memory the CPU and the NPU both read in place, whatever
+// GGML_HEXAGON_HOSTBUF says: llama.cpp's KV cache for attention on the CPU
+// while writing (LLAMA_ATTN_CPU_DECODE).
+static ggml_backend_buffer_type_t ggml_backend_hexagon_dev_shared_host_buffer_type(ggml_backend_dev_t dev) {
+    auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    return &dev_ctx->host_buffer_type;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_shared_host_buffer_type") == 0) {
+        return (void *) ggml_backend_hexagon_dev_shared_host_buffer_type;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }

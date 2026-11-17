@@ -223,8 +223,20 @@ llama_kv_cache::llama_kv_cache(
             // device's host-visible memory, which both can read in place
             if (llama_attn_cpu_decode_env() && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(dev);
+                if (host == nullptr) {
+                    // Hexagon offers its shared memory as the host buffer
+                    // type only with GGML_HEXAGON_HOSTBUF, which also moves
+                    // weights there; this asks for it for the cache alone.
+                    using fn_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t);
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    auto fn = reg ? (fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_shared_host_buffer_type") : nullptr;
+                    host = fn ? fn(dev) : nullptr;
+                }
                 if (host != nullptr && ggml_backend_buft_is_host(host) && ggml_backend_dev_supports_buft(dev, host)) {
                     buft = host;
+                } else {
+                    LLAMA_LOG_WARN("%s: attn_cpu_decode: layer %d stays in %s memory the CPU cannot read; its attention stays there\n",
+                        __func__, il, dev_name);
                 }
             }
         }
