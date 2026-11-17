@@ -3,7 +3,15 @@ ggml-org/llama.cpp#30306 (brianchmielNV/llama.cpp @ 98a74c9) onto this tree.
 Drop once upstream llama.cpp merges Dory.
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -2360,7 +2360,10 @@ void llama_context::output_reorder() {
+@@ -119,6 +119,7 @@
+     cparams.embeddings_nextn        = false;
+     cparams.embeddings_nextn_masked = false;
+     cparams.offload_kqv             = params.offload_kqv;
++    cparams.attn_cpu_decode         = params.offload_kqv && llama_attn_cpu_decode_env();
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+ 
+@@ -2360,7 +2361,10 @@
  
  uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
      uint32_t res;

@@ -218,6 +218,15 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // attention on the CPU for writing: the cache goes in the
+            // device's host-visible memory, which both can read in place
+            if (llama_attn_cpu_decode_env() && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(dev);
+                if (host != nullptr && ggml_backend_buft_is_host(host) && ggml_backend_dev_supports_buft(dev, host)) {
+                    buft = host;
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

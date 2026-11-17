@@ -164,6 +164,14 @@ export type NativeContextParams = {
   expert_cache_no_cap?: boolean
 
   /**
+   * With layers on an accelerator (the Hexagon NPU): keep the KV cache in its
+   * host-visible memory and run attention on the CPU for batches under 32
+   * tokens (writing), on the accelerator for larger ones (prompt reading)
+   * (fork addition). Needs flash attention. Default false.
+   */
+  attn_cpu_decode?: boolean
+
+  /**
    * With expert_cache_mb: a file the cache rewrites with its counters (JSON:
    * hits, misses, passthrough, readMb, usedMb, budgetMb, prefetched,
    * prefetchUsed, prefetchLate, prefetchWasted, and where generation passes'

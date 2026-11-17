@@ -119,6 +119,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.attn_cpu_decode         = params.offload_kqv && llama_attn_cpu_decode_env();
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 

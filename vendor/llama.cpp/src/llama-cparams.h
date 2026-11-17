@@ -3,7 +3,20 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
+
+// LLAMA_ATTN_CPU_DECODE=1: keep the KV cache in the accelerator's host-visible
+// memory and run attention on the CPU for small batches (writing), on the
+// accelerator for large ones (prompt reading). For the Hexagon NPU, whose
+// attention runs on its vector units and slows down with context.
+inline bool llama_attn_cpu_decode_env() {
+    const char * v = std::getenv("LLAMA_ATTN_CPU_DECODE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+// Batches below this run attention on the CPU when attn_cpu_decode is on.
+#define LLAMA_ATTN_CPU_DECODE_MAX_TOKENS 32
 
 #define LLAMA_MAX_SEQ 256
 
@@ -37,6 +50,7 @@ struct llama_cparams {
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
     bool offload_kqv;
+    bool attn_cpu_decode;    // see llama_attn_cpu_decode_env()
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)

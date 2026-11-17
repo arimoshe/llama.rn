@@ -1182,6 +1182,9 @@ struct llm_graph_context {
     // attention
     //
 
+    // LLAMA_ATTN_CPU_DECODE: places a KV-cache node on the CPU for small batches
+    ggml_tensor * attn_cpu(ggml_tensor * node, const ggml_tensor * kv = nullptr) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]

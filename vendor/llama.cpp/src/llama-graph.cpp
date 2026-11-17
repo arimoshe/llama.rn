@@ -2608,6 +2608,23 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// LLAMA_ATTN_CPU_DECODE: a node that writes or reads the KV cache runs on the
+// CPU when the batch is small (writing) and the cache sits in memory the CPU
+// can read in place; large batches (prompt reading) stay on the accelerator.
+ggml_tensor * llm_graph_context::attn_cpu(ggml_tensor * node, const ggml_tensor * kv) const {
+    if (!cparams.attn_cpu_decode || backend_cpu == nullptr || n_tokens >= LLAMA_ATTN_CPU_DECODE_MAX_TOKENS) {
+        return node;
+    }
+    if (kv == nullptr) {
+        kv = node;
+    }
+    const ggml_tensor * t = kv->view_src ? kv->view_src : kv;
+    if (t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+        ggml_backend_sched_set_tensor_backend(sched, node, backend_cpu);
+    }
+    return node;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2651,6 +2668,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        attn_cpu(cur, k);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2895,8 +2913,8 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, attn_cpu(mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)));
+        ggml_build_forward_expand(gf, attn_cpu(mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)));
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -2987,7 +3005,7 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, attn_cpu(mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -3046,7 +3064,7 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs_mla();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, attn_cpu(mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)));
     }
 
     const auto & kq_mask = inp->get_kq_mask_mla();
@@ -3145,13 +3163,13 @@ ggml_tensor * llm_graph_context::build_attn(
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, attn_cpu(mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)));
     }
 
     if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, attn_cpu(mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)));
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
@@ -3221,7 +3239,7 @@ ggml_tensor * llm_graph_context::build_attn(
     if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, attn_cpu(mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)));
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();

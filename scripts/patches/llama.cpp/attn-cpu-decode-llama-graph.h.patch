@@ -1,0 +1,14 @@
+Attention on the CPU while writing, on the NPU while reading the prompt (LLAMA_ATTN_CPU_DECODE).
+
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1182,6 +1182,9 @@
+     // attention
+     //
+ 
++    // LLAMA_ATTN_CPU_DECODE: places a KV-cache node on the CPU for small batches
++    ggml_tensor * attn_cpu(ggml_tensor * node, const ggml_tensor * kv = nullptr) const;
++
+     ggml_tensor * build_attn_mha(
+             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]

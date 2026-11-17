@@ -390,6 +390,16 @@ static common_grammar makeGrammar(common_grammar_type type, std::string grammar)
             }
         }
 
+        // Attention on the CPU while writing, on the accelerator while
+        // reading the prompt (fork addition, llama-graph.cpp): the KV cache
+        // goes in the accelerator's host-visible memory. Process-wide like
+        // the expert cache; a load without it turns it off again.
+        if (getPropertyAsBool(params, "attn_cpu_decode", false)) {
+            setenv("LLAMA_ATTN_CPU_DECODE", "1", 1);
+        } else {
+            unsetenv("LLAMA_ATTN_CPU_DECODE");
+        }
+
         // Model metadata overrides (fork addition), e.g. a looped model's
         // { "dory.num_loops": 2, "dory.recurrent_kv_cache_mode": "last_loop" }.
         // A whole number is an int, any other number a float. JavaScript has
